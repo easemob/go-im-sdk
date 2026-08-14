@@ -94,20 +94,6 @@ func main() {
 		OnTokenWillExpire: func(expiresAt time.Time) {
 			logger.Warn("IM token will expire", "expires_at", expiresAt.UTC().Format(time.RFC3339))
 		},
-		OnTokenRotated: func(_ string, expiresIn int64) {
-			logger.Info("IM token rotated", "expires_in", expiresIn)
-		},
-		OnUserForbidden: func() { logger.Warn("IM user forbidden") },
-		OnUserRemoved:   func() { logger.Warn("IM user removed") },
-		OnUserKickedByOtherDevice: func(device, reason string) {
-			logger.Warn("IM user kicked by other device", "device", device, "reason", reason)
-		},
-		OnUserLoginAnotherDevice: func(device, reason string) {
-			logger.Warn("IM user logged in on another device", "device", device, "reason", reason)
-		},
-		OnServerNotice: func(kind string, payload []byte) {
-			logger.Info("IM server notice", "kind", kind, "payload_bytes", len(payload))
-		},
 	})
 	if err != nil {
 		logger.Error("SDK configuration rejected", "error", err)

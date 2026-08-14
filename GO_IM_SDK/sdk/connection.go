@@ -406,9 +406,6 @@ func (c *Client) acceptProvision(p *internalprotocol.Provision) {
 		if json.Unmarshal(p.AuthToken, &v) == nil && v.Token != "" {
 			expiresAt := tokenExpiryTime(v.ExpiresIn, time.Now())
 			c.updateProvisionToken(v.Token, expiresAt)
-			if cb := c.callbackSnapshot().tokenRotated; cb != nil {
-				c.emit(func() { cb(v.Token, v.ExpiresIn) })
-			}
 			c.scheduleTokenExpiryWarning(expiresAt)
 		}
 	}
@@ -691,10 +688,6 @@ func (c *Client) fireErrorCallback(err error) {
 	case ErrTokenExpired:
 		if callbacks.tokenExpired != nil {
 			c.emit(callbacks.tokenExpired)
-		}
-	case ErrUserForbidden:
-		if callbacks.forbidden != nil {
-			c.emit(callbacks.forbidden)
 		}
 	}
 }

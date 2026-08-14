@@ -2,7 +2,6 @@ package sdk
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -188,7 +187,7 @@ func (r *connectionRun) processMetas(metas []internalprotocol.Meta) (err error) 
 		case internalprotocol.NamespaceStatistic:
 			r.handleStatistic(m.Payload)
 		case internalprotocol.NamespaceNotify:
-			r.handleNotify(m.Payload)
+			continue
 		case internalprotocol.NamespaceMUC:
 			continue
 		}
@@ -237,49 +236,23 @@ func (r *connectionRun) deliverMessage(msg *Message) (err error) {
 	return err
 }
 
-func (r *connectionRun) handleNotify(payload []byte) {
-	var v struct {
-		Type string `json:"type"`
-	}
-	if json.Unmarshal(payload, &v) == nil {
-		switch v.Type {
-		case "user_metadata_updated", "subscribe_metadata_updated", "contact_metadata_updated":
-			return
-		}
-	}
-	if cb := r.client.callbackSnapshot().notice; cb != nil {
-		b := append([]byte(nil), payload...)
-		r.client.emit(func() { cb("NOTIFY", b) })
-	}
-}
-
 func (r *connectionRun) handleStatistic(payload []byte) {
 	s, decodeErr := r.client.codec.DecodeStatistic(payload)
 	if decodeErr != nil {
 		return
 	}
 	var err error
-	callbacks := r.client.callbackSnapshot()
 	switch s.Operation {
 	case internalprotocol.StatisticInformation:
 		return
 	case internalprotocol.StatisticUserRemoved:
 		err = newError(ErrAuthentication, "session", "user removed")
-		if cb := callbacks.removed; cb != nil {
-			r.client.emit(cb)
-		}
 	case internalprotocol.StatisticUserLoginAnotherDevice:
 		err = newError(ErrAuthentication, "session", "another device login")
-		if cb := callbacks.otherLogin; cb != nil {
-			r.client.emit(func() { cb(s.ReplaceDeviceName, s.Reason) })
-		}
 	case internalprotocol.StatisticUserKickedByChangePassword:
 		err = newError(ErrKickedChangePass, "session", "password changed")
 	case internalprotocol.StatisticUserKickedByOtherDevice:
 		err = newError(ErrAuthentication, "session", "kicked by other device")
-		if cb := callbacks.kicked; cb != nil {
-			r.client.emit(func() { cb(s.ReplaceDeviceName, s.Reason) })
-		}
 	}
 	if err != nil {
 		r.fail(err)

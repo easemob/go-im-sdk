@@ -87,6 +87,43 @@ func (c *Client) UpdateOwnUserInfo(ctx context.Context, attrs map[string]string)
 		"application/x-www-form-urlencoded", userInfoServiceCode)
 }
 
+// UserInfoField identifies one of the standard user properties accepted by
+// UpdateOwnUserInfoField. Its value is the wire-level property name so that
+// callers can use the same names with UpdateOwnUserInfo for custom fields.
+type UserInfoField string
+
+const (
+	UserInfoNickname  UserInfoField = "nickname"
+	UserInfoAvatarURL UserInfoField = "avatarurl"
+	UserInfoPhone     UserInfoField = "phone"
+	UserInfoMail      UserInfoField = "mail"
+	UserInfoGender    UserInfoField = "gender"
+	UserInfoSign      UserInfoField = "sign"
+	UserInfoBirth     UserInfoField = "birth"
+	UserInfoExt       UserInfoField = "ext"
+)
+
+func (f UserInfoField) valid() bool {
+	switch f {
+	case UserInfoNickname, UserInfoAvatarURL, UserInfoPhone, UserInfoMail,
+		UserInfoGender, UserInfoSign, UserInfoBirth, UserInfoExt:
+		return true
+	default:
+		return false
+	}
+}
+
+// UpdateOwnUserInfoField updates one standard user property. It is a
+// convenience wrapper around UpdateOwnUserInfo; empty values are passed
+// through to the server so callers can use the same API if the service
+// supports clearing a property.
+func (c *Client) UpdateOwnUserInfoField(ctx context.Context, field UserInfoField, value string) (*Response, error) {
+	if !field.valid() {
+		return nil, fmt.Errorf("unsupported user info field %q", field)
+	}
+	return c.UpdateOwnUserInfo(ctx, map[string]string{string(field): value})
+}
+
 // FetchUserInfo fetches selected properties for the supplied users without caching them.
 func (c *Client) FetchUserInfo(ctx context.Context, users, properties []string) (*Response, error) {
 	body, err := json.Marshal(struct {

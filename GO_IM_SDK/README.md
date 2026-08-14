@@ -44,7 +44,7 @@ import (
 func main() {
     client, err := imsdk.New(imsdk.Config{
         AppKey:   "org#app",
-        Resource: loadStableResource(), // 保存原始值；SDK 会自动加前缀
+        Resource: loadStableResource(), // 加载已持久化的 UUID 类原始值；SDK 自动加前缀
         MessageHandler: func(ctx context.Context, msg *imsdk.Message) error {
             // 先可靠持久化/投递；返回 nil 后 SDK 才推进队列。
             return persistIdempotently(ctx, msg.MetaID, msg)
@@ -54,7 +54,6 @@ func main() {
         },
         OnDisconnect: func(err error) { log.Printf("IM disconnected: %v", err) },
         OnTokenExpired: func() { log.Print("IM token expired") },
-        OnUserForbidden: func() { log.Print("IM user forbidden") },
     })
     if err != nil { log.Fatal(err) }
     defer client.Close(context.Background())
@@ -71,14 +70,15 @@ func main() {
 
 SDK 固定请求 `https://rs.easemob.com/easemob/server.json`，并携带 `sdk_version`、`app_key` 和 `file_version=1`。返回的 `msync-wx.hosts` 和 `rest.hosts` 分别决定 WSS 与 REST 地址；优先选择 `priority=1`，否则使用第一个有效 host。WSS 接受 `wss` 或可转换为 `wss` 的 `https`，REST 只接受 `https`。缺少任一有效地址、HTTP 失败、响应过大或 JSON 无效都会直接使登录失败。
 
-`Resource` 是必填的原始稳定设备身份。业务方必须持久化它：同一逻辑服务实例重启后继续使用原值；同一 IM 用户若有多个并行在线实例，每个实例必须使用不同值。SDK 不自动生成、不持久化，也无法跨机器检查重复。SDK 实际使用 `go-server-imsdk-<resource>`；前缀计入最终 128 字符限制，最终值不得包含空白、`/` 或 `@`。
+`Resource` 是必填的原始稳定设备身份，首次部署时应生成 UUID 一类具有足够随机性的字符串。业务必须持久化原始值；同一逻辑服务发生宕机、重启或故障转移时必须继续使用原值。更换 Resource 会被服务端视为从另一台设备登录。已经上线的实例即使旧值不是 UUID 格式，也必须继续使用已持久化的旧值，不能为了改格式而替换。SDK 不自动生成或持久化 Resource。SDK 实际使用 `go-server-imsdk-<resource>`；前缀计入最终 128 字符限制，最终值不得包含空白、`/` 或 `@`。
+
+一个 IM 用户只能供一个服务实例在线使用。不要让多个服务实例共享同一用户，也不要同时在其他 Client 或设备登录该用户；后登录的实例或 Client 会导致当前服务连接被踢下线。SDK 目前没有单独的“被踢”回调，业务必须自行保证账号独占，并通过 `OnDisconnect(error)` 和 SDK 错误码观察连接终止。
 
 默认值：心跳间隔 120 秒、心跳超时 240 秒、连接/发送超时 15 秒、登出超时 5 秒、
 最大帧 4 MiB、写队列 256、handler 超时 30 秒、重试 3 次、跨队列并发 4。
 
-所有要使用的 listener 都必须在 `New` 的 `Config` 中传入，登录后不动态补注册，也不补发历史事件。这确保首批同步消息能被初始化时的 `MessageHandler` 接收。生产程序应处理 `OnDisconnect`、`OnTokenRotated`、`OnTokenWillExpire`、`OnTokenExpired`、`OnUserForbidden`、`OnUserRemoved`、`OnUserKickedByOtherDevice`、`OnUserLoginAnotherDevice` 和 `OnServerNotice`。listener 必须快速返回，不要在回调中执行长时间阻塞任务。
-这些业务性断开不会自动重连。PROVISION 返回轮换 token 时，使用 `OnTokenRotated` 将新 token 写入
-业务 secret 存储；SDK 自身不会持久化凭据。
+所有要使用的 listener 都必须在 `New` 的 `Config` 中传入，登录后不动态补注册，也不补发历史事件。这确保首批同步消息能被初始化时的 `MessageHandler` 接收。生产程序应处理 `OnDisconnect`、`OnTokenWillExpire` 和 `OnTokenExpired`。listener 必须快速返回，不要在回调中执行长时间阻塞任务。
+这些业务性断开不会自动重连。登录 token 的申请、刷新和持久化由业务负责；SDK 只维护当前会话的内存 token，业务主动刷新后可调用 `UpdateToken`。
 
 PROVISION 的 `auth_token.expires_in` 会被记录为绝对过期时间（兼容秒/毫秒时间戳及相对秒数）。业务可用
 `TokenExpiresAt()` 查询，也可注册 `OnTokenWillExpire` 接收提前告警；默认提前 5 分钟，使用
@@ -238,6 +238,6 @@ protobuf-lite 是 SDK 内部静态依赖，不是用户安装依赖；实际版�
 
 - 不要把 token、生产配置、pidfile 或日志提交到版本库。
 - 不要在 handler、日志或 telemetry 中记录 Authorization、token 或完整消息正文。
-- 定期轮换 token，并实现 token 过期/轮换回调；业务性禁用或踢出应由上层告警和人工/业务策略恢复。
+- 由业务定期刷新并安全持久化 token，实现 token 将过期/已过期回调；业务性禁用或踢出应由上层告警和人工/业务策略恢复。
 - redirect 由 SDK 限制为安全 endpoint，不要在外围将其转换为明文连接。
 - 对收到的消息内容按不可信输入处理；转发到数据库、模板、shell 或其他系统前执行相应转义和校验。

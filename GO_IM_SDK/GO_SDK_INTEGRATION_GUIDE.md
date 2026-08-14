@@ -84,7 +84,7 @@ CGO_ENABLED=1 GOARCH=arm64 go test -tags nativecodecdev ./...
 | 参数 | 必填 | 说明 |
 | --- | --- | --- |
 | `AppKey` | 是 | `org#app` 格式；DNS 查询和 REST 根路径都由它派生 |
-| `Resource` | 是 | 业务持久化的原始设备/实例标识；SDK 自动增加固定前缀 |
+| `Resource` | 是 | 业务生成并持久化的 UUID 类原始实例标识；SDK 自动增加固定前缀 |
 | `MessageHandler` | 是 | 实时消息处理函数，必须在 `New` 时传入 |
 | `Domain` | 否 | JID domain，默认 `easemob.com` |
 | `Logger` | 否 | 自定义 `*slog.Logger` |
@@ -99,12 +99,6 @@ OnConnectionStateChanged  func(imsdk.ConnState)
 OnDisconnect              func(error)
 OnTokenExpired            func()
 OnTokenWillExpire         func(time.Time)
-OnTokenRotated            func(string, int64)
-OnUserForbidden           func()
-OnUserRemoved             func()
-OnUserKickedByOtherDevice func(string, string)
-OnUserLoginAnotherDevice  func(string, string)
-OnServerNotice            func(string, []byte)
 ```
 
 listener 在 `New` 时绑定，因此 DNS/登录失败、Provision 和首批同步消息发生前已经就绪。SDK 不补发注册之前的历史事件，也不支持登录后动态添加 listener。回调由有界队列调度，必须快速返回；需要数据库、RPC 或 secret 持久化时，应立即投递到业务自己的有界工作队列。
@@ -114,16 +108,22 @@ listener 在 `New` 时绑定，因此 DNS/登录失败、Provision 和首批同�
 业务配置保存原始值：
 
 ```yaml
-resource: "service-instance-01"
+resource: "550e8400-e29b-41d4-a716-446655440000"
 ```
 
 SDK 在 Provision、JID 和 REST `resource` query 中统一使用：
 
 ```text
-go-server-imsdk-service-instance-01
+go-server-imsdk-550e8400-e29b-41d4-a716-446655440000
 ```
 
-固定前缀是 `go-server-imsdk-`，并计入最终 128 字符限制。最终值不能包含空白、`/`、`@`。业务必须持久化原始值并在同一逻辑实例重启后复用；同一用户的并行在线实例必须使用不同原始值。不要把已经带前缀的值再次传给 SDK，否则前缀会再次添加。SDK 不负责生成、保存或跨机器查重 resource。
+固定前缀是 `go-server-imsdk-`，并计入最终 128 字符限制。最终值不能包含空白、`/`、`@`。首次部署时，原始值应采用 UUID 一类具有足够随机性的字符串。业务必须生成并持久化这个原始值，同一逻辑服务发生宕机、重启或故障转移时必须复用原值；更换它会被服务端视为从另一台设备登录。已经上线的实例即使旧值不是 UUID 格式，也必须继续使用已持久化的旧值。不要把已经带前缀的值再次传给 SDK，否则前缀会再次添加。SDK 不负责生成或保存 Resource。
+
+### 单用户单服务约束
+
+一个 IM 用户只能供一个服务实例在线使用。多个服务实例不能共享同一用户，即使它们配置了不同的 Resource；也不要同时在其他 Client 或设备登录该用户。后登录的服务或 Client 会触发换设备登录，导致原服务连接被踢下线。
+
+SDK 目前不提供独立的“被踢下线”回调。业务需要自行保证服务账号的独占使用，并在 `OnDisconnect(error)` 中结合 SDK 错误码/原因处理连接终止。不要依赖被踢后自动恢复：如果另一个实例仍在反复登录，双方可能持续互相挤下线。
 
 `Config` 不再包含或需要 `UserID`、`Token`、`MsyncHost`、`RestBase`、`SDKVersion`：
 
@@ -245,26 +245,10 @@ func run() error {
 		OnDisconnect: func(err error) {
 			logger.Warn("connection.disconnected", "error", err)
 		},
-		OnTokenRotated: func(newToken string, expiresIn int64) {
-			// 不要记录 newToken；把它快速投递到业务 secret 存储流程。
-			_ = newToken
-			logger.Info("token.rotated", "expires_in", expiresIn)
-		},
 		OnTokenWillExpire: func(expiresAt time.Time) {
 			logger.Warn("token.will_expire", "expires_at", expiresAt)
 		},
 		OnTokenExpired:  func() { logger.Error("token.expired") },
-		OnUserForbidden: func() { logger.Error("user.forbidden") },
-		OnUserRemoved:   func() { logger.Error("user.removed") },
-		OnUserKickedByOtherDevice: func(device, reason string) {
-			logger.Warn("user.kicked", "device", device, "reason", reason)
-		},
-		OnUserLoginAnotherDevice: func(device, reason string) {
-			logger.Warn("user.other_login", "device", device, "reason", reason)
-		},
-		OnServerNotice: func(kind string, payload []byte) {
-			logger.Info("server.notice", "kind", kind, "payload_bytes", len(payload))
-		},
 	})
 	if err != nil {
 		return fmt.Errorf("create IM client: %w", err)
@@ -312,7 +296,7 @@ export GO_IM_SDK_TOKEN='...'
 go run .
 ```
 
-生产环境建议通过权限受控的 secret file/secret manager 注入 token。`OnTokenRotated` 收到的新 token 必须由业务持久化；SDK 只更新当前 Client 的内存 token。
+生产环境建议通过权限受控的 secret file/secret manager 注入 token。token 的申请、刷新和持久化完全由业务负责；业务取得新 token 后可调用 `UpdateToken` 更新当前 Client 的内存凭据。
 
 ### Login、Logout 和 Close 的边界
 
@@ -429,7 +413,7 @@ if errors.As(err, &sdkErr) {
 }
 ```
 
-生产程序至少应处理 Config 中的断线、token 轮换/过期、用户禁用/移除、其他设备踢出/登录等 listener。
+生产程序至少应处理 Config 中的断线和 token 将过期/已过期 listener。用户禁用、移除、被其他设备踢出或其他设备登录仍会终止当前连接，并通过 `OnDisconnect(error)` 及 SDK 错误码/原因报告，不提供独立回调。业务必须保证每个 IM 用户只被一个服务实例使用，避免多个服务或其他 Client 使用同一账号互相挤下线。
 
 ## 六、发送消息
 
@@ -618,6 +602,25 @@ if err != nil {
 	return err
 }
 log.Printf("status=%d body=%s", response.StatusCode, response.Body)
+
+单字段更新可以使用枚举化的便捷封装。它内部复用 `UpdateOwnUserInfo`，仍然使用相同的
+REST、鉴权和错误处理逻辑：
+
+```go
+response, err := client.UpdateOwnUserInfoField(
+	ctx,
+	imsdk.UserInfoNickname,
+	"Go Bot",
+)
+if err != nil {
+	return err
+}
+log.Printf("status=%d body=%s", response.StatusCode, response.Body)
+```
+
+当前标准字段枚举包括 `UserInfoNickname`、`UserInfoAvatarURL`、`UserInfoPhone`、
+`UserInfoMail`、`UserInfoGender`、`UserInfoSign`、`UserInfoBirth` 和 `UserInfoExt`。
+需要一次更新多个字段，或更新 SDK 未枚举的业务扩展字段时，继续使用上面的 map 版本。
 
 response, err = client.FetchUserInfo(
 	ctx,
@@ -875,11 +878,12 @@ if err := client.Close(context.Background()); err != nil {
 
 - token 来自 secret manager/secret file，不在源码、配置仓库或日志中明文保存；
 - WSS/REST 未写入业务配置，网络策略允许固定 DNS 引导地址和 DNS 返回域名；
-- 原始 `Resource` 已持久化，并理解 SDK 会添加 `go-server-imsdk-` 前缀；
+- 首次部署生成 UUID 类原始 `Resource` 并持久化；宕机、重启和故障转移会复用原值，并理解 SDK 会添加 `go-server-imsdk-` 前缀；
+- 每个 IM 用户只分配给一个服务实例，部署和测试环境均没有其他服务或 Client 同时登录该用户；
 - `MessageHandler` 和所有 listener 都在 `New` 的 `Config` 中注册；
 - `MessageHandler` 按 `MetaID` 幂等，可靠落库后才返回 `nil`；
 - handler、listener、日志和 telemetry 不执行无界阻塞操作；
-- 已处理 DNS、token 轮换/将过期/已过期、用户禁用/移除、踢出和其他设备登录事件；
+- 已处理 DNS、token 将过期/已过期；用户禁用/移除/踢出/其他设备登录通过 `OnDisconnect` 统一处理，并明确 SDK 没有独立的被踢回调；
 - 只在成功 `Login` 且 `Connected()` 为 true 时发送；
 - 消息级 `Ext`、CMD `Params` 和 Custom `CustomExts` 没有混用；
 - 发送结果不确定时复用原 `ClientMessageID`，不会盲目生成新 ID 重发；

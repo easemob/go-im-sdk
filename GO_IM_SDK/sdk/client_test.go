@@ -60,12 +60,6 @@ func TestListenersAreBoundDuringInitialization(t *testing.T) {
 	config.OnDisconnect = func(error) {}
 	config.OnTokenExpired = func() {}
 	config.OnTokenWillExpire = func(time.Time) {}
-	config.OnTokenRotated = func(string, int64) {}
-	config.OnUserForbidden = func() {}
-	config.OnUserRemoved = func() {}
-	config.OnUserKickedByOtherDevice = func(string, string) {}
-	config.OnUserLoginAnotherDevice = func(string, string) {}
-	config.OnServerNotice = func(string, []byte) {}
 	c, err := New(config)
 	if err != nil {
 		t.Fatal(err)
@@ -73,8 +67,7 @@ func TestListenersAreBoundDuringInitialization(t *testing.T) {
 	defer c.Close(context.Background())
 	callbacks := c.callbackSnapshot()
 	if callbacks.connection == nil || callbacks.disconnect == nil || callbacks.tokenExpired == nil ||
-		callbacks.tokenWillExpire == nil || callbacks.tokenRotated == nil || callbacks.forbidden == nil ||
-		callbacks.removed == nil || callbacks.kicked == nil || callbacks.otherLogin == nil || callbacks.notice == nil {
+		callbacks.tokenWillExpire == nil {
 		t.Fatalf("callbacks were not fully bound: %#v", callbacks)
 	}
 }
@@ -184,5 +177,21 @@ func TestProvisionTokenExpiryIsRecordedAndWarned(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("expiry warning not delivered")
+	}
+}
+
+func TestProvisionReplacementTokenUpdatesSessionState(t *testing.T) {
+	c, err := New(validConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(context.Background())
+	c.acceptProvision(&internalprotocol.Provision{AuthToken: []byte(`{"token":"replacement","expires_in":1800000000}`)})
+	if c.tokenValue() != "replacement" {
+		t.Fatalf("current token was not updated")
+	}
+	expiresAt, ok := c.TokenExpiresAt()
+	if !ok || !expiresAt.Equal(time.Unix(1_800_000_000, 0)) {
+		t.Fatalf("expiry=%v ok=%v", expiresAt, ok)
 	}
 }

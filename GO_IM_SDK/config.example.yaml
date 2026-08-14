@@ -12,10 +12,13 @@ token_file: ""
 token: ""
 
 domain: "easemob.com"
-# Required raw stable device identity. Persist and reuse it after restart. The
-# SDK sends go-server-imsdk-<resource>; the prefixed value must fit 128 chars
-# and contain no whitespace, '/' or '@'. Parallel instances need unique values.
-resource: "service-instance-01"
+# Required UUID-like raw stable device identity. Generate it once, persist it,
+# and reuse it after a crash, restart, or failover. Changing it is treated as a
+# login from another device. The SDK sends go-server-imsdk-<resource>; the
+# prefixed value must fit 128 chars and contain no whitespace, '/' or '@'.
+# One IM user may be used by only one service instance; another service or
+# client logging in as that user will kick this connection, with no kick callback.
+resource: "550e8400-e29b-41d4-a716-446655440000"
 heartbeat_interval_seconds: 120
 heartbeat_timeout_seconds: 240
 disable_reconnect: false

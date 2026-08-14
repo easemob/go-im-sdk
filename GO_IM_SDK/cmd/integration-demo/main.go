@@ -93,18 +93,6 @@ func main() {
 		},
 		OnTokenExpired:    func() { logger.Warn("token.expired") },
 		OnTokenWillExpire: func(at time.Time) { logger.Warn("token.will_expire", "expires_at", at.UTC().Format(time.RFC3339)) },
-		OnTokenRotated:    func(_ string, expiresIn int64) { logger.Info("token.rotated", "expires_in", expiresIn) },
-		OnUserForbidden:   func() { logger.Warn("user.forbidden") },
-		OnUserRemoved:     func() { logger.Warn("user.removed") },
-		OnUserKickedByOtherDevice: func(device, reason string) {
-			logger.Warn("user.kicked_by_other_device", "device", device, "reason", reason)
-		},
-		OnUserLoginAnotherDevice: func(device, reason string) {
-			logger.Warn("user.login_another_device", "device", device, "reason", reason)
-		},
-		OnServerNotice: func(kind string, payload []byte) {
-			logger.Info("server.notice", "kind", kind, "payload_bytes", len(payload))
-		},
 	})
 	if err != nil {
 		logger.Error("integration SDK initialization failed", "error", err)

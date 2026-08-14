@@ -44,37 +44,45 @@ type TelemetryEvent struct {
 }
 
 type Config struct {
-	AppKey                    string
-	Domain                    string
-	Resource                  string
-	HeartbeatInterval         time.Duration
-	HeartbeatTimeout          time.Duration
-	ConnectTimeout            time.Duration
-	SendTimeout               time.Duration
-	LogoutTimeout             time.Duration
-	DisableReconnect          bool
-	MaxRedirectHops           int
-	MaxFrameBytes             int64
-	WriteQueueSize            int
-	HandlerTimeout            time.Duration
-	HandlerMaxAttempts        int
-	HandlerConcurrency        int
-	TokenExpiryWarningBefore  time.Duration
-	HTTPClient                *http.Client
-	Logger                    *slog.Logger
-	Telemetry                 Telemetry
-	Debug                     bool
-	MessageHandler            MessageHandler
-	OnConnectionStateChanged  func(ConnState)
-	OnDisconnect              func(error)
-	OnTokenExpired            func()
-	OnTokenWillExpire         func(time.Time)
-	OnTokenRotated            func(string, int64)
-	OnUserForbidden           func()
-	OnUserRemoved             func()
-	OnUserKickedByOtherDevice func(string, string)
-	OnUserLoginAnotherDevice  func(string, string)
-	OnServerNotice            func(string, []byte)
+	AppKey string
+	Domain string
+	// Resource is a UUID-like stable identity for this logical service
+	// instance. The application must generate it once, persist the raw value,
+	// and reuse exactly the same value after a crash, restart, or failover.
+	// Changing it is treated by the server as logging in from another device.
+	// Existing deployments must retain their persisted value even if it is not
+	// UUID-shaped.
+	// The SDK adds the go-server-imsdk- prefix before using it.
+	// Each IM user may be used by only one live service instance; logging in from
+	// another service or client kicks this connection and is reported through
+	// OnDisconnect, without a dedicated kick callback.
+	Resource                 string
+	HeartbeatInterval        time.Duration
+	HeartbeatTimeout         time.Duration
+	ConnectTimeout           time.Duration
+	SendTimeout              time.Duration
+	LogoutTimeout            time.Duration
+	DisableReconnect         bool
+	MaxRedirectHops          int
+	MaxFrameBytes            int64
+	WriteQueueSize           int
+	HandlerTimeout           time.Duration
+	HandlerMaxAttempts       int
+	HandlerConcurrency       int
+	TokenExpiryWarningBefore time.Duration
+	HTTPClient               *http.Client
+	Logger                   *slog.Logger
+	Telemetry                Telemetry
+	Debug                    bool
+	MessageHandler           MessageHandler
+	OnConnectionStateChanged func(ConnState)
+	OnDisconnect             func(error)
+	// OnTokenExpired reports that authentication failed because the current
+	// token is already expired. The connection is terminal at this point.
+	OnTokenExpired func()
+	// OnTokenWillExpire reports the expiry time learned from Provision before
+	// it is reached, using TokenExpiryWarningBefore as the lead time.
+	OnTokenWillExpire func(time.Time)
 }
 
 type LoginState int
@@ -144,13 +152,7 @@ type callbacks struct {
 	connection      func(ConnState)
 	disconnect      func(error)
 	tokenExpired    func()
-	forbidden       func()
-	removed         func()
-	kicked          func(string, string)
-	otherLogin      func(string, string)
-	tokenRotated    func(string, int64)
 	tokenWillExpire func(time.Time)
-	notice          func(string, []byte)
 }
 
 type Client struct {
@@ -209,9 +211,6 @@ func New(cfg Config) (*Client, error) {
 		callbacks: callbacks{
 			connection: cfg.OnConnectionStateChanged, disconnect: cfg.OnDisconnect,
 			tokenExpired: cfg.OnTokenExpired, tokenWillExpire: cfg.OnTokenWillExpire,
-			tokenRotated: cfg.OnTokenRotated, forbidden: cfg.OnUserForbidden,
-			removed: cfg.OnUserRemoved, kicked: cfg.OnUserKickedByOtherDevice,
-			otherLogin: cfg.OnUserLoginAnotherDevice, notice: cfg.OnServerNotice,
 		},
 		wsDialer: &websocket.Dialer{HandshakeTimeout: cfg.ConnectTimeout, Proxy: http.ProxyFromEnvironment, EnableCompression: false}}
 	c.eventWG.Add(1)

@@ -72,6 +72,51 @@ func TestUpdateOwnUserInfo(t *testing.T) {
 	}
 }
 
+func TestUpdateOwnUserInfoField(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s", r.Method)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if got := r.Form.Get(string(UserInfoNickname)); got != "Go Bot" {
+			t.Errorf("nickname = %q", got)
+		}
+		if len(r.Form) != 1 {
+			t.Errorf("form = %#v", r.Form)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	response, err := restTestClient(server, nil).UpdateOwnUserInfoField(
+		context.Background(), UserInfoNickname, "Go Bot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+}
+
+func TestUpdateOwnUserInfoFieldRejectsUnknownField(t *testing.T) {
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+	defer server.Close()
+
+	_, err := restTestClient(server, nil).UpdateOwnUserInfoField(
+		context.Background(), UserInfoField("department"), "IM")
+	if err == nil || !strings.Contains(err.Error(), "unsupported user info field") {
+		t.Fatalf("error = %v", err)
+	}
+	if called {
+		t.Fatal("unexpected request for unsupported user info field")
+	}
+}
+
 func TestFetchUserInfo(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/org/app/metadata/user/get" {
