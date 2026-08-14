@@ -1,0 +1,250 @@
+syntax = "proto2";
+package easemob.pb;
+
+import "jid.proto";
+import "keyvalue.proto";
+
+option optimize_for = LITE_RUNTIME;
+
+message MSync {
+  enum Version {
+    MSYNC_V1 = 0;
+    MSYNC_V2 = 1;
+  }
+
+  enum Command {
+    SYNC       = 0;
+    UNREAD     = 1;
+    NOTICE     = 2;
+    PROVISION  = 3;
+    LOGOUT     = 4; //logout 交互信令
+  }
+
+  optional Version version            = 1 [ default = MSYNC_V1 ];
+  optional JID     guid               = 2;
+  optional string  auth               = 3;
+  optional uint32  compress_algorimth = 4;
+  optional uint32  crypto             = 5;
+  optional string  user_agent         = 6;
+  optional uint64  pov                = 7;
+  optional Command command            = 8;
+  optional uint32  device_id          = 10;
+  repeated EncryptType encrypt_type   = 11;  //encrypt type.
+  optional string encrypt_key         = 12;  //encrypted symmetric key.
+  optional bytes tag                  = 13;  //aes_gcm tag
+  optional bytes iv                  = 14;  //aes_gcm iv
+
+  // It could be one of CommSyncUL, CommSyncDL, CommUnreadUL, CommUnreadDL, or CommNotice.
+  // It is compressed if compress_algorimth is not zero.
+  optional bytes payload              = 9;
+  optional uint64 trace_id            = 20; //The unique id trace to request.
+}
+
+enum EncryptType
+{
+  ENCRYPT_NONE     = 0;
+  ENCRYPT_AES_128_CBC = 1; //default encryption type.
+  ENCRYPT_AES_256_CBC = 2; //
+  ENCRYPT_AES_GCM = 3;
+}
+
+message CommSyncUL {
+  // for client to send meta to server
+  optional Meta meta    = 1; // not "repeated", UL send one meta every time.
+
+  // for server to send meta to client
+  optional uint64 key   = 2;
+  optional JID    queue = 3;
+  
+  optional bool   is_roam = 4;
+  optional uint64 last_full_roam_key = 5;
+  optional RoamConfig roam_config = 6;
+}
+
+ message RoamConfig{
+    optional bool is_positive = 1; //是否选择正向拉取漫游（从最老向最新拉取），默认是false
+    optional uint64 pull_number = 2; //单次漫游拉取数量，如果没有设置，会按照服务端默认设置50来拉取。
+  }
+
+message CommSyncDL {
+  // for client to send meta to server
+  optional Status status    = 1;
+  optional uint64 meta_id   = 2;
+  optional uint64 server_id = 3;
+
+  // for server send meta to client
+  repeated Meta   metas     = 4;
+  optional uint64 next_key  = 5;
+  optional JID    queue     = 6;
+  optional bool   is_last   = 7;
+
+  optional uint64 timestamp = 8; // in milli_seconds, server time.
+  optional bool   is_roam = 9;
+}
+
+message CommNotice {
+  optional JID queue = 1;
+}
+
+message CommUnreadUL {
+  // empty
+}
+
+message CommUnreadDL {
+  optional Status    status    = 1;
+  repeated MetaQueue unread    = 2;
+  optional uint64    timestamp = 3; // in milli_seconds, server time.
+}
+
+message MetaQueue {
+  // system meta queue is identified by easemob.com which have no user name.
+  optional JID     queue    = 1;
+  optional uint32  n        = 2;
+}
+
+message Meta
+{
+  enum NameSpace {
+    STATISTIC   = 0;
+    CHAT        = 1;
+    MUC         = 2;
+    ROSTER      = 3; // ROSTER ops
+    CONFERENCE  = 4; // realtime calling
+    NOTIFY      = 5; //  notify from server, payload is json
+    QUERY       = 6; //  query from sdk, paydload is json
+  }
+
+  enum RouteType {
+    ROUTE_ALL = 0;
+    ROUTE_ONLINE = 1; //just send messages to online users
+    ROUTE_DIRECT = 2; // send group/room message to special users
+  }
+
+  optional uint64    id        = 1;
+  optional JID       from      = 2; // if appkey is absent, it assumes to be as same as the `guid`.
+  optional JID       to        = 3; // if appkey is absent, it assumes to be as same as the `from`
+  optional uint64    timestamp = 4; // in milli_seconds, server gerenated.
+  optional NameSpace ns        = 5;
+  optional bytes     payload   = 6; // put different body to payload accoring different namespace
+  optional RouteType routetype = 7; // route messages to users by different rules
+  repeated KeyValue  ext       = 8; //chatroom message priority
+  optional bytes     meta      = 9; 
+  repeated string directed_users = 10;//userIds to receive message in group/room chat
+  optional uint64 expire_time = 11; //server used only, for pin message expire time
+  optional uint64 local_timestamp = 12; // client local system timestamp in milliseconds
+  optional string env = 13; // environment for callback routing
+}
+
+// ext{//消息优先级设定
+//    optional uint64 chatroom_msg_tag = 1; // 1 - 20 ,chatroom message priority
+//}
+
+message Status {
+  enum ErrorCode {
+    OK                = 0;
+    FAIL              = 1;
+    UNAUTHORIZED      = 2;
+    MISSING_PARAMETER = 3;
+    WRONG_PARAMETER   = 4;
+    REDIRECT          = 5;
+    TOKEN_EXPIRED     = 6;
+    PERMISSION_DENIED = 7; // if user in blacklist
+    NO_ROUTE          = 8; // for multi IDC, or wrong user domain
+    UNKNOWN_COMMAND   = 9;
+    PB_PARSER_ERROR   = 10; // for protobuf parser error
+    BIND_ANOTHER_DEVICE = 11; // user already login on another device manually
+    IM_FORBIDDEN        = 12; // user is forbidden to login
+    TOO_MANY_DEVICES    = 13; // user login exceed the limitation of device number
+    PLATFORM_LIMIT    = 14; // for limit user login without opening platform
+    USER_MUTED        = 15; // user is muted in group
+    ENCRYPT_DISABLE   = 16; // encryption disable.
+    ENCRYPT_ENABLE    = 17; // use encryption.
+    DECRYPT_FAILURE   = 18; // decryption failure.
+    PERMISSION_DENIED_EXTERNAL = 19; // blocked by external logic.
+    RESOURCE_CHANGED = 20; // user login changed resource.
+  };
+
+  optional ErrorCode     error_code    = 1;
+  optional string        reason        = 2;
+  repeated RedirectInfo  redirect_info = 3; // for error_code == REDIRECT
+}
+
+message RedirectInfo {
+  optional string  host = 1;
+  optional uint32  port = 2;
+}
+
+message Provision
+{
+    enum OsType
+    {
+        OS_IOS      = 0;
+        OS_ANDROID  = 1;
+        OS_LINUX    = 2;
+        OS_OSX      = 3;
+        OS_WIN      = 4;
+        OS_CUSTOM   = 5;
+        OS_HARMONY  = 6;
+        OS_GO       = 7;
+        OS_OTHER    = 16;
+    }
+
+    enum NetworkType
+    {
+        NETWORK_NONE    = 0;
+        NETWORK_WIFI    = 1;
+        NETWORK_4G      = 2;
+        NETWORK_3G      = 3;
+        NETWORK_2G      = 4;
+        NETWORK_WIRE    = 5;
+    }
+
+    enum CompressType
+    {
+        COMPRESS_NONE    = 0;
+        COMPRESS_ZLIB    = 1;
+        COMPRESS_LZ4     = 2; // 新增 lz4流式压缩
+    }
+
+    enum CompressDirection
+    {
+        ONLY_UP    = 0; // 仅上行压缩
+        ONLY_DOWN    = 1; // 仅下行压缩
+        BI     = 2; // 双向压缩
+    }
+
+    optional OsType          os_type         = 1;
+    optional string          version         = 2;
+    optional NetworkType     network_type    = 3;
+    optional string          app_sign        = 4;
+    repeated CompressType    compress_type   = 5;
+    repeated EncryptType     encrypt_type    = 6;   //encrypt type.
+    optional string          encrypt_key     = 7;   //asymmetric public-key.
+    optional Status          status          = 8;   // indicate login failure etc.
+    optional string          device_uuid     = 9;   // used for multi-device login
+    optional bool            is_manual_login = 10;  // indicate if login manually
+    optional string          password        = 11;  // use password to login when dns is hijacked
+    optional string          device_name     = 12;  // device name or custom device name if have
+    optional string          resource        = 13;  // resource for bind device
+    optional string          auth            = 14;  // store login token
+    optional string          app_id          = 15;  // user client version
+    optional string          serviceId       = 16;  // sdk serviceId
+    optional string          action_version  = 17;  //为了避免旧版本的SDK收到新增Thread功能的影响，需要在provision协议中增加字段，告知MSync哪些SDK支持新功能
+    optional bytes           auth_token      = 18;  // style:{"vid":123,"cid":456,"token":"007"}
+    optional uint32          os_custom_value = 19;  //when os_type is OS_CUSTOM
+    optional string          session_id      = 20;  //connection unique id
+    optional string          reason          = 21;  //notify other device reason
+    // 对于客户端：发送协商请求，提供数组选项，可以多选
+    // 对于服务器：返回协商请求结果，可以修改返回结果。返回结果：空数组、没有返回值表示不压缩，返回非空数组，使用数组元素1作为压缩算法类型
+    repeated CompressType protocol_compress_type   = 22;
+    // 压缩方向： 默认 1
+    optional CompressDirection    protocol_compress_direction = 23;
+    optional bytes           ntp_key = 24; // NTP 时间同步密钥，服务端在 provision reply 中下发
+}
+
+message Logout
+{
+    optional string session_id = 1; //connection unique id
+    optional string reason = 2; //provide logout extension message
+    optional Status status = 3; //indicate logout success/failure etc.
+}

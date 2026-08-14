@@ -1,0 +1,144 @@
+package easemob.pb;
+import "keyvalue.proto";
+import "jid.proto";
+
+option optimize_for = LITE_RUNTIME;
+
+message MessageBody
+{
+  message Content
+  {
+    enum Type
+    {
+      TEXT = 0;       //Text, json value: 'ext'
+      IMAGE = 1;      //Image, json value: 'img'
+      VIDEO = 2;      //Video, json value: 'audio'
+      LOCATION = 3;   //Location, json value: 'loc'
+      VOICE = 4;      //Voice, json value: 'audio'
+      FILE = 5;       //File, json value 'file'
+      COMMAND = 6;    //Command, json value 'cmd'
+      CUSTOM = 7;     //Custom, json value 'custom'
+      COMBINE = 8;    //combined message for forward
+    };
+
+    enum SubType
+    {
+      SUB_COMBINE = 0;
+      SUB_GIF = 1;
+      SUB_STREAM = 10; // Stream message subtype
+    };
+
+    message Size
+    {
+      optional double width = 1; // json key: 'width'
+      optional double height = 2; // json key: 'height'
+    }
+
+    optional Type type = 1; // json key: 'type'
+
+    //text body field
+    optional string text = 2; // json key: 'msg'
+
+    //location body field
+    optional double latitude = 3; // json key: 'lat'
+    optional double longitude = 4; // json key: 'lng'
+    optional string address = 5; // json key: 'addr'
+
+    //file body field
+    optional string displayName = 6; // json key: 'filename'
+    optional string remotePath = 7; // json key: 'url'
+    optional string secretKey = 8; // json key: 'secret'
+    optional int32 fileLength = 9;  // json key: 'file_length'
+
+    //command body field
+    optional string action = 10; // json key: 'action'
+    repeated KeyValue params = 11; // json key: 'param'
+
+    //voice and video field
+    optional int32 duration = 12; // json key: 'length'
+
+    //size field for video and image
+    optional Size size = 13;    // json key: 'size'
+
+    //thumbnail field
+    optional string thumbnailRemotePath = 14;  // json key: 'thumb'
+    optional string thumbnailSecretKey = 15;  // json key: 'thumb_secret';
+    optional string thumbnailDisplayName = 16; // json key: 'thumbFilename';
+    optional int32  thumbnailFileLength = 17; // json key: 'thumbFileLength'
+    optional Size   thumbnailSize = 18; // json key: { 'thumbSize': { 'thumbWidth': width, 'thumbHeight': height } }
+
+    //custom body field
+    optional string customEvent = 19;
+    repeated KeyValue customExts = 20;
+
+    //build name for location body field
+    optional string buildingName = 21;
+
+    //sub type
+    optional SubType subType = 22;
+    //title for combined message
+    optional string title = 23;
+    //summary for combined message
+    optional string summary = 24;
+    // Identifies the hierarchy of combined messages
+    optional int32 combineLevel = 25;
+    //标识发送方发送的是原图的还是压缩过后的图 1：原图 2：压缩过后的图
+    optional int32 imageType = 26;
+  }
+
+  enum Type {
+    NORMAL      = 0;
+    CHAT        = 1;
+    GROUPCHAT   = 2;
+    CHATROOM    = 3;
+    READ_ACK    = 4;
+    DELIVER_ACK = 5;
+    RECALL      = 6;
+    CHANNEL_ACK = 7;
+    EDIT 	= 8;
+  }
+
+  enum EditScope {
+    BODY = 1;
+    BODY_AND_EXT = 2;
+  }
+  
+  message MessageConfig {
+    optional bool allow_group_ack = 1; // if allow/need group ack
+  }
+
+  message Stream {
+    enum StreamStatus {
+      STREAM_START = 0;            // Stream started
+      STREAM_START_COMPLETED = 1;  // Stream started and completed in one chunk (single fragment)
+      STREAM_IN_PROGRESS = 2;      // Stream in progress
+      STREAM_COMPLETED = 3;        // Stream completed
+      STREAM_FULL = 4;             // Full content in contents.text
+    }
+
+    optional string stream_type = 1;          // Text format type, e.g. "markdown"
+    optional uint32 stream_seq = 2;           // Sequence number, start from 0
+    optional StreamStatus stream_status = 3;  // Stream status
+    optional uint32 stream_error = 4;         // Error code, normal = 0
+    optional int32 stream_finish_reason = 5; // Finish reason, passthrough (supports negative values)
+  }
+
+  optional Type    type     = 1;
+  optional JID   from     = 2; // json key: 'from'
+  optional JID   to       = 3; // json key: 'to'
+  repeated Content contents = 4; // json key: 'bodies'
+  repeated KeyValue ext   = 5; // json key: 'ext'
+  optional uint64    ack_message_id = 6; // xml，从SDK 5.0开始，使用ack_message_ids替换该字段
+  optional MessageConfig msg_config = 7; // message related config
+  optional string       ack_content = 8; //user content for ack message
+  optional bytes meta = 9; // json string, translation content, eidt operator, count etc
+  optional bool update_channel = 10; //not used by SDK
+  optional uint64 edit_message_id = 11; //edit message id
+  optional EditScope edit_scope = 12; // edit message scope
+  optional Stream stream = 13; // Stream metadata
+  optional int32 userinfo_update_time = 14; // user info update time (timestamp for seconds)
+  optional int32 namecard_update_time = 15; // namecard update time (timestamp for seconds)
+  optional bool send_to_peer = 16;     // channel_ack是否发送给对方，不传时为 true，SDK 5.0设置为 false，只发给账号的多设备
+  repeated uint64 ack_message_ids = 17;      // 要发送已读 ack 的消息 ID，须属同一会话
+  optional bool clear_all_unread_message_count = 18;       // 发送channel_ack时，是否清除所有会话的未读数
+}
