@@ -84,6 +84,146 @@ PROVISION 的 `auth_token.expires_in` 会被记录为绝对过期时间（兼容
 `TokenExpiresAt()` 查询，也可注册 `OnTokenWillExpire` 接收提前告警；默认提前 5 分钟，使用
 `Config.TokenExpiryWarningBefore` 调整。示例程序对应 `token_expiry_warning_seconds`。
 
+## 生命周期与消息流
+
+### 初始化与登录
+
+```mermaid
+flowchart TD
+    subgraph 初始化
+        A["New(Config)"] --> B["校验 + 补默认值<br/>MessageHandler 必填"]
+        B --> C["启动事件分发协程 dispatchEvents"]
+        B --> D["启动 HandlerConcurrency 个 batchWorker"]
+        C & D --> E["返回 Client（未登录）"]
+    end
+
+    subgraph 登录 Login(ctx, userID, token)
+        F["校验参数 + 加锁"] --> G["状态 LoggingIn/Connecting<br/>回调 ConnStateConnecting"]
+        G --> H["resolveLoginEndpoints<br/>DNS 引导取 WSS/REST 地址"]
+        H --> I["connectWithRedirects<br/>WebSocket 拨号，起 readPump/writePump"]
+        I --> J["发送 PROVISION 登录帧"]
+        J --> K{"PROVISION 响应"}
+        K -->|OK| L["acceptProvision 记录 sessionID/token"]
+        K -->|REDIRECT| M["跟随重定向，回到拨号"]
+        K -->|鉴权/业务错误| N["登录失败返回 error"]
+        L --> O["发送首个 UNREAD 保活"]
+        O --> P["启动 heartbeat 协程"]
+        P --> Q["状态 LoggedIn/Connected<br/>回调 ConnStateConnected"]
+        Q --> R["go monitor 开始监控连接"]
+    end
+```
+
+### 发送消息
+
+```mermaid
+sequenceDiagram
+    participant App as 业务
+    participant C as Client
+    participant W as writePump
+    participant S as 服务端
+
+    App->>C: Send(ctx, SendRequest)
+    C->>C: 编码 Meta + SYNC 帧
+    C->>C: 登记 pending[ClientMessageID]
+    C->>W: sendFrame（writes 通道）
+    W->>S: WebSocket 二进制帧
+    S-->>W: SYNC 下行（MetaID=ClientMessageID, ServerID）
+    W-->>C: readPump 解码 → completeACK
+    C-->>App: 返回 SendResult{MessageID=ServerID}
+    Note over App,S: 超时/断线返回 ErrSendOutcomeUnknown，重试须复用 ClientMessageID
+```
+
+### 接收消息
+
+```mermaid
+sequenceDiagram
+    participant S as 服务端
+    participant R as readPump
+    participant C as Client
+    participant W as batchWorker
+    participant App as 业务 MessageHandler
+
+    S->>R: NOTICE（队列 X 有新消息）
+    R->>C: startQueue(X)
+    C->>S: 发送 SYNC(X, key) 拉取
+    S-->>R: SYNC 批量（Metas[], NextKey）
+    R->>C: handleBatch → 非阻塞入 batches 通道
+    C->>W: 取出批次
+    W->>W: processBatch → processMetas
+    loop 每条消息
+        W->>App: MessageHandler(ctx, msg)
+        App-->>W: 返回 nil 才推进
+    end
+    W->>C: 推进 key=NextKey
+    alt NextKey>0 还有更多
+        C->>S: 继续 SYNC(X, NextKey)
+    else 到尾部 / IsLast
+        C->>C: 队列置空闲，保留游标
+    end
+```
+
+### 心跳与重连
+
+- **心跳**：`heartbeat` 协程每 `HeartbeatInterval`(120s) 发一个空 `UNREAD` 当 ping；收到 `UNREAD` 下行当 pong 并更新 `lastPong`；超过 `HeartbeatTimeout`(240s) 未收到 pong、或 readPump 读超时则断链。
+- **网络断线自动重连**：状态切 `Reconnecting`，三段随机退避（5~10s / 20~40s / 60~120s），稳定运行超 5 分钟重置退避档位；重连后队列游标从 0 重新开始，可能重投历史消息，业务需按 `MetaID` 幂等。
+- **业务性断开不重连**：被踢出、鉴权失败、token 过期等进入终态，触发 `OnDisconnect`。
+
+## 回调处理
+
+所有 listener 都在 `New` 的 `Config` 中注册，登录后不补注册、不补发历史事件。除 `MessageHandler` 外的回调都跑在**同一个事件分发协程**上，必须快速返回；`MessageHandler` 跑在 `batchWorker` 池上。
+
+| 回调 | 必填 | 触发时机 | 运行线程 |
+|---|---|---|---|
+| `MessageHandler(ctx, *Message) error` | ✅ | 每条收到的聊天消息（at-least-once） | batchWorker 池 |
+| `OnConnectionStateChanged(ConnState)` | — | 连接状态变化 | 事件分发协程 |
+| `OnDisconnect(error)` | — | 业务性断开，不会自动重连 | 事件分发协程 |
+| `OnTokenExpired()` | — | 登录 token 已过期 | 事件分发协程 |
+| `OnTokenWillExpire(time.Time)` | — | token 即将过期（提前告警） | 事件分发协程 |
+
+### MessageHandler（消息处理）
+
+```go
+MessageHandler: func(ctx context.Context, msg *imsdk.Message) error {
+    // 1. 按 msg.MetaID 幂等持久化/投递，成功后才 return nil
+    // 2. 必须尊重 ctx：超时后及时返回，不要忽略 ctx 永久阻塞
+    // 3. 返回 error 会重试（最多 HandlerMaxAttempts=3 次，每次 HandlerTimeout=30s）
+    return persistIdempotently(ctx, msg.MetaID, msg)
+},
+```
+
+- 返回 `nil` 后 SDK 才推进队列进度；返回 error 重试后仍失败则**死信该条并继续**，不拆链。
+- 投递语义 at-least-once：重连时服务端可能重投同一批次，必须按 `MetaID` 幂等。
+- handler 超时未返回会被 `Health().StuckHandlers` 观测；SDK 无法强杀忽略 ctx 的 handler，业务需自行限制阻塞时长并管理外部资源。
+
+### OnConnectionStateChanged
+
+`ConnState` 取值：`ConnStateDisconnected` / `ConnStateConnecting` / `ConnStateConnected` / `ConnStateReconnecting`。用于展示在线状态与 ready 判定（通常 `Connected()` 为 true 才报 ready）。
+
+### OnDisconnect
+
+仅在**业务性断开（不会自动重连）**时触发。通过 `errorCode(err)` 区分原因：
+
+| 错误码 | 含义 | 建议 |
+|---|---|---|
+| `ErrTokenExpired` / `ErrInvalidToken` | token 过期/无效 | 重新申请 token 后重新 Login |
+| `ErrUserForbidden` | 用户被禁用 | 告警 + 业务处理 |
+| `ErrBindAnotherDevice` / `ErrTooManyDevices` | 被其他设备/超限挤下线 | 检查账号独占 |
+| `ErrResourceChanged` | Resource 变更 | 检查持久化 Resource |
+| `ErrAuthentication` / `ErrPermissionDenied` / `ErrAppActiveLimit` / `ErrUserNotFound` | 鉴权/权限/配额 | 告警排查 |
+| `ErrKickedChangePass` | 改密被踢 | 重新登录 |
+
+网络类错误（`ErrIO` / `ErrTimeout` / `ErrTLSFailed` / `ErrStreamClosed` / `ErrDNS`）走自动重连，**不会**触发 `OnDisconnect`。`DisableReconnect=true` 时任何断开都会转为 `OnDisconnect`。
+
+### OnTokenExpired / OnTokenWillExpire
+
+- `OnTokenExpired`：登录后服务端判定 token 已过期，连接进入终态（同时触发 `OnDisconnect`），需重新走 `Login`。
+- `OnTokenWillExpire`：由 PROVISION 的 `expires_in` 计算绝对过期时间，提前 `TokenExpiryWarningBefore`（默认 5 分钟）回调；业务可借此刷新 token 并调用 `UpdateToken`，也可用 `TokenExpiresAt()` 主动查询。
+
+### 回调注意事项
+
+- 除 `MessageHandler` 外的回调都在同一事件分发协程执行，必须快速返回，不要在回调里做阻塞/耗时操作（需要则起独立 goroutine）。
+- 事件队列有界，慢回调会导致事件被丢弃（日志会告警），连接状态始终可通过 `Health()` 查询兜底。
+
 ## 集成验收 Demo
 
 `cmd/integration-demo` 用于客户环境联调，覆盖 DNS 引导登录、连接状态、session ID、可选测试消息发送与 ACK、消息级 Ext、收到消息回调日志、token 生命周期和可选 REST 用户信息探测。`message_json` 是脱敏视图：保留消息元数据、body 类型和 Ext，不包含文本正文、CMD Params、CustomExts 或原始 payload。日志不输出 token 或 Authorization。
