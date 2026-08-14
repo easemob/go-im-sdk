@@ -7,7 +7,7 @@
 ```bash
 cd GO_IM_SDK
 go version                 # Go 1.21+
-go test -tags gopbcodec ./...
+CGO_ENABLED=1 go test ./...
 go get github.com/easemob/go-im-sdk/sdk@latest
 ```
 
@@ -18,7 +18,7 @@ cd GO_IM_SDK
 CGO_ENABLED=1 go build ./cmd/your-service
 ```
 
-`gopbcodec` 仅用于仓库内部回归和 macOS 本地联调，不属于客户正式发布构建。
+客户发布构建只使用 native codec；Go generated protobuf 和协议源码不属于客户正式发布包。
 
 ## 文档导航
 
@@ -44,7 +44,7 @@ import imsdk "github.com/easemob/go-im-sdk/sdk"
 cd GO_IM_SDK
 cp config.example.yaml prod.yaml
 chmod 600 prod.yaml
-go build -tags gopbcodec -o ./bin/integration-demo ./cmd/integration-demo
+CGO_ENABLED=1 go build -o ./bin/integration-demo ./cmd/integration-demo
 ./bin/integration-demo -c prod.yaml -debug
 ```
 

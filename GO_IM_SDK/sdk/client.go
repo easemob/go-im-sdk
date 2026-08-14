@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,32 +44,37 @@ type TelemetryEvent struct {
 }
 
 type Config struct {
-	MsyncHost                string
-	RestBase                 string
-	AppKey                   string
-	UserID                   string
-	Token                    string
-	Domain                   string
-	Resource                 string
-	SDKVersion               string
-	HeartbeatInterval        time.Duration
-	HeartbeatTimeout         time.Duration
-	ConnectTimeout           time.Duration
-	SendTimeout              time.Duration
-	LogoutTimeout            time.Duration
-	DisableReconnect         bool
-	MaxRedirectHops          int
-	MaxFrameBytes            int64
-	WriteQueueSize           int
-	HandlerTimeout           time.Duration
-	HandlerMaxAttempts       int
-	HandlerConcurrency       int
-	TokenExpiryWarningBefore time.Duration
-	HTTPClient               *http.Client
-	Logger                   *slog.Logger
-	Telemetry                Telemetry
-	Debug                    bool
-	MessageHandler           MessageHandler
+	AppKey                    string
+	Domain                    string
+	Resource                  string
+	HeartbeatInterval         time.Duration
+	HeartbeatTimeout          time.Duration
+	ConnectTimeout            time.Duration
+	SendTimeout               time.Duration
+	LogoutTimeout             time.Duration
+	DisableReconnect          bool
+	MaxRedirectHops           int
+	MaxFrameBytes             int64
+	WriteQueueSize            int
+	HandlerTimeout            time.Duration
+	HandlerMaxAttempts        int
+	HandlerConcurrency        int
+	TokenExpiryWarningBefore  time.Duration
+	HTTPClient                *http.Client
+	Logger                    *slog.Logger
+	Telemetry                 Telemetry
+	Debug                     bool
+	MessageHandler            MessageHandler
+	OnConnectionStateChanged  func(ConnState)
+	OnDisconnect              func(error)
+	OnTokenExpired            func()
+	OnTokenWillExpire         func(time.Time)
+	OnTokenRotated            func(string, int64)
+	OnUserForbidden           func()
+	OnUserRemoved             func()
+	OnUserKickedByOtherDevice func(string, string)
+	OnUserLoginAnotherDevice  func(string, string)
+	OnServerNotice            func(string, []byte)
 }
 
 type LoginState int
@@ -157,7 +161,10 @@ type Client struct {
 	state              LoginState
 	connState          ConnState
 	run                *connectionRun
+	userID             string
 	token              string
+	msyncHost          string
+	restBase           string
 	sessionID          string
 	generation         atomic.Uint64
 	lastInbound        atomic.Int64
@@ -195,10 +202,17 @@ func New(cfg Config) (*Client, error) {
 		eventCancel()
 		return nil, fmt.Errorf("initialize protocol codec: %w", err)
 	}
-	c := &Client{cfg: cfg, logger: cfg.Logger, state: LoginStateLogout, connState: ConnStateDisconnected, token: cfg.Token, idPrefix: binary.BigEndian.Uint64(seed[:]) & 0xffffffff00000000,
+	c := &Client{cfg: cfg, logger: cfg.Logger, state: LoginStateLogout, connState: ConnStateDisconnected, idPrefix: binary.BigEndian.Uint64(seed[:]) & 0xffffffff00000000,
 		eventCtx: eventCtx, eventCancel: eventCancel, events: make(chan func(), cfg.WriteQueueSize),
 		batches: make(chan batchJob, cfg.WriteQueueSize),
 		codec:   codec, debug: cfg.Debug,
+		callbacks: callbacks{
+			connection: cfg.OnConnectionStateChanged, disconnect: cfg.OnDisconnect,
+			tokenExpired: cfg.OnTokenExpired, tokenWillExpire: cfg.OnTokenWillExpire,
+			tokenRotated: cfg.OnTokenRotated, forbidden: cfg.OnUserForbidden,
+			removed: cfg.OnUserRemoved, kicked: cfg.OnUserKickedByOtherDevice,
+			otherLogin: cfg.OnUserLoginAnotherDevice, notice: cfg.OnServerNotice,
+		},
 		wsDialer: &websocket.Dialer{HandshakeTimeout: cfg.ConnectTimeout, Proxy: http.ProxyFromEnvironment, EnableCompression: false}}
 	c.eventWG.Add(1)
 	go c.dispatchEvents()
@@ -214,9 +228,6 @@ func New(cfg Config) (*Client, error) {
 func applyDefaultsAndValidate(c *Config) error {
 	if c.Domain == "" {
 		c.Domain = "easemob.com"
-	}
-	if c.SDKVersion == "" {
-		c.SDKVersion = "4.0.0-go"
 	}
 	if c.HeartbeatInterval <= 0 {
 		c.HeartbeatInterval = 120 * time.Second
@@ -273,33 +284,25 @@ func applyDefaultsAndValidate(c *Config) error {
 	if c.MessageHandler == nil {
 		return fmt.Errorf("MessageHandler is required")
 	}
-	if c.AppKey == "" || c.UserID == "" || c.Token == "" || c.Resource == "" {
-		return fmt.Errorf("AppKey, UserID, Token and Resource are required")
+	if c.AppKey == "" || c.Resource == "" {
+		return fmt.Errorf("AppKey and Resource are required")
 	}
-	if len(c.Resource) > 128 || strings.ContainsAny(c.Resource, " \t\r\n/@") {
-		return fmt.Errorf("Resource must be 1-128 characters without whitespace, '/', '@'")
+	c.Resource = resourcePrefix + c.Resource
+	if len(c.Resource) > maxResourceLength || strings.ContainsAny(c.Resource, " \t\r\n/@") {
+		return fmt.Errorf("Resource with SDK prefix must be 1-%d characters without whitespace, '/', '@'", maxResourceLength)
 	}
-	if !strings.Contains(c.AppKey, "#") {
+	org, app, ok := strings.Cut(c.AppKey, "#")
+	if !ok || org == "" || app == "" || strings.Contains(app, "#") || strings.ContainsAny(org+app, " \t\r\n/") {
 		return fmt.Errorf("AppKey must have org#app form")
 	}
-	mu, err := url.Parse(c.MsyncHost)
-	if err != nil || mu.Scheme != "wss" || mu.Host == "" {
-		return fmt.Errorf("MsyncHost must be a valid wss URL")
-	}
-	if mu.Path == "" {
-		mu.Path = "/websocket"
-		c.MsyncHost = mu.String()
-	}
-	if mu.RawQuery != "" || mu.Fragment != "" {
-		return fmt.Errorf("MsyncHost query and fragment are not allowed")
-	}
-	ru, err := url.Parse(c.RestBase)
-	if err != nil || ru.Scheme != "https" || ru.Host == "" {
-		return fmt.Errorf("RestBase must be a valid https URL")
-	}
-	c.RestBase = strings.TrimRight(c.RestBase, "/")
 	return nil
 }
+
+const (
+	sdkVersion        = "4.0.0-go"
+	resourcePrefix    = "go-server-imsdk-"
+	maxResourceLength = 128
+)
 
 func (c *Client) LoginState() LoginState { c.mu.RLock(); defer c.mu.RUnlock(); return c.state }
 func (c *Client) Connected() bool {
@@ -347,45 +350,6 @@ func (c *Client) TokenExpiresAt() (time.Time, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.tokenExpiresAt, !c.tokenExpiresAt.IsZero()
-}
-
-func (c *Client) OnConnectionStateChanged(fn func(ConnState)) {
-	c.mu.Lock()
-	c.callbacks.connection = fn
-	c.mu.Unlock()
-}
-func (c *Client) OnDisconnect(fn func(error)) {
-	c.mu.Lock()
-	c.callbacks.disconnect = fn
-	c.mu.Unlock()
-}
-func (c *Client) OnTokenExpired(fn func())  { c.mu.Lock(); c.callbacks.tokenExpired = fn; c.mu.Unlock() }
-func (c *Client) OnUserForbidden(fn func()) { c.mu.Lock(); c.callbacks.forbidden = fn; c.mu.Unlock() }
-func (c *Client) OnUserRemoved(fn func())   { c.mu.Lock(); c.callbacks.removed = fn; c.mu.Unlock() }
-func (c *Client) OnUserKickedByOtherDevice(fn func(string, string)) {
-	c.mu.Lock()
-	c.callbacks.kicked = fn
-	c.mu.Unlock()
-}
-func (c *Client) OnUserLoginAnotherDevice(fn func(string, string)) {
-	c.mu.Lock()
-	c.callbacks.otherLogin = fn
-	c.mu.Unlock()
-}
-func (c *Client) OnTokenRotated(fn func(string, int64)) {
-	c.mu.Lock()
-	c.callbacks.tokenRotated = fn
-	c.mu.Unlock()
-}
-func (c *Client) OnTokenWillExpire(fn func(time.Time)) {
-	c.mu.Lock()
-	c.callbacks.tokenWillExpire = fn
-	c.mu.Unlock()
-}
-func (c *Client) OnServerNotice(fn func(string, []byte)) {
-	c.mu.Lock()
-	c.callbacks.notice = fn
-	c.mu.Unlock()
 }
 
 func (c *Client) callbackSnapshot() callbacks {

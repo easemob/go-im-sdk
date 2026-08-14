@@ -4,3 +4,9 @@
 *.log
 /prod.yaml
 /native/build/
+/native/private/
+/native/src/
+/native/tests/
+/proto/
+/pb/
+/tmp_dump/

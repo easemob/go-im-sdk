@@ -1,4 +1,4 @@
-//go:build !gopbcodec && ((linux && (!cgo || (!amd64 && !arm64))) || (nativecodecdev && (!cgo || !darwin || (!amd64 && !arm64))))
+//go:build (linux && (!cgo || (!amd64 && !arm64))) || (nativecodecdev && (!cgo || !darwin || (!amd64 && !arm64)))
 
 package nativecodec
 

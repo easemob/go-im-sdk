@@ -83,7 +83,7 @@ func (c *Client) UpdateOwnUserInfo(ctx context.Context, attrs map[string]string)
 		form.Set(key, value)
 	}
 	return c.doREST(ctx, "update_own_user_info", http.MethodPut,
-		"/metadata/user/"+url.PathEscape(c.cfg.UserID), "", strings.NewReader(form.Encode()),
+		"/metadata/user/"+url.PathEscape(c.currentUserID()), "", strings.NewReader(form.Encode()),
 		"application/x-www-form-urlencoded", userInfoServiceCode)
 }
 
@@ -126,7 +126,7 @@ func (c *Client) CreatePublicGroup(ctx context.Context, name string, opt CreateP
 		Welcome           string   `json:"welcome,omitempty"`
 		Members           []string `json:"members,omitempty"`
 	}{
-		Name: name, Description: opt.Description, Owner: c.cfg.UserID,
+		Name: name, Description: opt.Description, Owner: c.currentUserID(),
 		Public: true, MemberOnly: false, AllowInvites: allowInvites,
 		InviteNeedConfirm: inviteNeedConfirm, MaxUsers: maxUsers,
 		Welcome: opt.Welcome, Members: opt.Members,
@@ -184,7 +184,16 @@ func (c *Client) doREST(ctx context.Context, operation, method, path, rawQuery s
 		c.recordRESTTelemetry(ctx, operation, 1, time.Since(started), statusCode, serviceCode, resultErr)
 	}()
 
-	base, err := url.Parse(c.cfg.RestBase)
+	c.mu.RLock()
+	restBase := c.restBase
+	loginState := c.state
+	token := c.token
+	c.mu.RUnlock()
+	if loginState == LoginStateLogout || loginState == LoginStateLoggingIn || restBase == "" {
+		resultErr = newError(ErrNotLoggedIn, operation, "REST requires a successful login")
+		return nil, resultErr
+	}
+	base, err := url.Parse(restBase)
 	if err != nil {
 		resultErr = fmt.Errorf("parse REST base URL: %w", err)
 		return nil, resultErr
@@ -198,7 +207,7 @@ func (c *Client) doREST(ctx context.Context, operation, method, path, rawQuery s
 		resultErr = fmt.Errorf("create REST request: %w", err)
 		return nil, resultErr
 	}
-	req.Header.Set("Authorization", "Bearer "+c.currentToken())
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/json")
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
@@ -328,10 +337,6 @@ func (c *Client) restHTTPClient() *http.Client {
 		return c.cfg.HTTPClient
 	}
 	return defaultRESTHTTPClient()
-}
-
-func (c *Client) currentToken() string {
-	return c.tokenValue()
 }
 
 func (c *Client) recordRESTTelemetry(ctx context.Context, operation string, attempt int, duration time.Duration,

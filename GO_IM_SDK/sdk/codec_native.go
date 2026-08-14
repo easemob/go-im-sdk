@@ -1,4 +1,4 @@
-//go:build !gopbcodec && (linux || nativecodecdev)
+//go:build linux || nativecodecdev
 
 package sdk
 

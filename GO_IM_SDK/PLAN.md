@@ -356,7 +356,7 @@ type MessageBody struct {
     RawPayload []byte                `json:"raw_payload,omitempty"`
 }
 
-// P2 修订：接收侧 KeyValue 类型化（8 种值类型，对齐 proto/keyvalue.proto）
+// P2 修订：接收侧 KeyValue 类型化（8 种协议值类型）
 // iOS/Android 发来的带类型属性（BOOL/INT/UINT/LLINT/FLOAT/DOUBLE/STRING/JSON_STRING）
 // 不再被降级为 string；发送侧仍只接受 string（业务 JSON 用户自解析）
 type KeyValue struct {
@@ -468,8 +468,6 @@ GO_IM_SDK/
 ├── go.mod / go.sum          module: 发布前确定的正式可引用路径（禁止使用裸 `emgosdk`）
 ├── README.md                使用/部署文档
 ├── PLAN.md                  本计划
-├── proto/                   5 个 proto 源文件（含 statisticsbody.proto）
-├── pb/                      生成的 Go pb 代码（protoc-gen-go v1.31+，--go_opt=M 映射）
 ├── sdk/
 │   ├── log.go               控制台日志（slog 薄封装）
 │   ├── errors.go            错误定义与映射（含 FAIL+reason 子串表）

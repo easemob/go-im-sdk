@@ -1,3 +1,5 @@
+//go:build linux || nativecodecdev
+
 package sdk
 
 import (
@@ -7,12 +9,15 @@ import (
 )
 
 func TestCloseFromEventCallbackDoesNotDeadlock(t *testing.T) {
-	c, err := New(validConfig())
+	done := make(chan struct{})
+	var c *Client
+	config := validConfig()
+	config.OnConnectionStateChanged = func(ConnState) { _ = c.Close(context.Background()); close(done) }
+	var err error
+	c, err = New(config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan struct{})
-	c.OnConnectionStateChanged(func(ConnState) { _ = c.Close(context.Background()); close(done) })
 	c.setStates(LoginStateLoggedIn, ConnStateConnected)
 	select {
 	case <-done:

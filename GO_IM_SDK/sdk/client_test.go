@@ -1,3 +1,5 @@
+//go:build linux || nativecodecdev
+
 package sdk
 
 import (
@@ -12,7 +14,7 @@ import (
 )
 
 func validConfig() Config {
-	return Config{MsyncHost: "wss://msync.example.com", RestBase: "https://rest.example.com/org/app", AppKey: "org#app", UserID: "user", Token: "secret", Resource: "go-service-01", MessageHandler: func(context.Context, *Message) error { return nil }}
+	return Config{AppKey: "org#app", Resource: "service-01", MessageHandler: func(context.Context, *Message) error { return nil }}
 }
 
 func TestConfigDefaultsAndSecurity(t *testing.T) {
@@ -20,21 +22,17 @@ func TestConfigDefaultsAndSecurity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.cfg.MsyncHost != "wss://msync.example.com/websocket" {
-		t.Fatalf("path default=%s", c.cfg.MsyncHost)
+	defer c.Close(context.Background())
+	if c.cfg.Resource != "go-server-imsdk-service-01" {
+		t.Fatalf("resource=%s", c.cfg.Resource)
 	}
 	if c.cfg.MaxFrameBytes != 4<<20 || c.cfg.HeartbeatInterval != 120*time.Second {
 		t.Fatal("defaults not applied")
 	}
 	bad := validConfig()
-	bad.MsyncHost = "ws://insecure"
+	bad.AppKey = "invalid"
 	if _, err = New(bad); err == nil {
-		t.Fatal("ws must be rejected")
-	}
-	bad = validConfig()
-	bad.RestBase = "http://insecure"
-	if _, err = New(bad); err == nil {
-		t.Fatal("http must be rejected")
+		t.Fatal("invalid AppKey must be rejected")
 	}
 }
 
@@ -48,6 +46,76 @@ func TestResourceIsRequiredAndValidated(t *testing.T) {
 	bad.Resource = "shared resource"
 	if _, err := New(bad); err == nil || !strings.Contains(err.Error(), "Resource") {
 		t.Fatalf("invalid resource error = %v", err)
+	}
+	tooLong := validConfig()
+	tooLong.Resource = strings.Repeat("x", maxResourceLength-len(resourcePrefix)+1)
+	if _, err := New(tooLong); err == nil || !strings.Contains(err.Error(), "prefix") {
+		t.Fatalf("too-long resource error = %v", err)
+	}
+}
+
+func TestListenersAreBoundDuringInitialization(t *testing.T) {
+	config := validConfig()
+	config.OnConnectionStateChanged = func(ConnState) {}
+	config.OnDisconnect = func(error) {}
+	config.OnTokenExpired = func() {}
+	config.OnTokenWillExpire = func(time.Time) {}
+	config.OnTokenRotated = func(string, int64) {}
+	config.OnUserForbidden = func() {}
+	config.OnUserRemoved = func() {}
+	config.OnUserKickedByOtherDevice = func(string, string) {}
+	config.OnUserLoginAnotherDevice = func(string, string) {}
+	config.OnServerNotice = func(string, []byte) {}
+	c, err := New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(context.Background())
+	callbacks := c.callbackSnapshot()
+	if callbacks.connection == nil || callbacks.disconnect == nil || callbacks.tokenExpired == nil ||
+		callbacks.tokenWillExpire == nil || callbacks.tokenRotated == nil || callbacks.forbidden == nil ||
+		callbacks.removed == nil || callbacks.kicked == nil || callbacks.otherLogin == nil || callbacks.notice == nil {
+		t.Fatalf("callbacks were not fully bound: %#v", callbacks)
+	}
+}
+
+func TestLoginRejectsAlreadyActiveClient(t *testing.T) {
+	c := &Client{state: LoginStateLoggedIn}
+	if err := c.Login(context.Background(), "user", "token"); errorCode(err) != ErrAlreadyLoggedIn {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestSendBeforeLoginReturnsLoginStateError(t *testing.T) {
+	c := &Client{state: LoginStateLogout}
+	if _, err := c.Send(context.Background(), SendRequest{}); errorCode(err) != ErrNotLoggedIn {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLogoutWithoutSessionKeepsClientReusable(t *testing.T) {
+	c, err := New(validConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Logout(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c.closed || c.LoginState() != LoginStateLogout {
+		t.Fatalf("closed=%v state=%s", c.closed, c.LoginState())
+	}
+	if err := c.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStaleReconnectAndTerminalEventsCannotReplaceLoggedOutState(t *testing.T) {
+	old := &connectionRun{}
+	c := &Client{state: LoginStateLogout, connState: ConnStateDisconnected}
+	c.reconnect(old)
+	c.recordTerminalForRun(old, newError(ErrIO, "old connection", ""))
+	if c.state != LoginStateLogout || c.connState != ConnStateDisconnected || c.lastErr != nil {
+		t.Fatalf("state=%s connection=%s last_error=%v", c.state, c.connState, c.lastErr)
 	}
 }
 
@@ -94,13 +162,14 @@ func TestTokenExpiryTimeFormats(t *testing.T) {
 }
 
 func TestProvisionTokenExpiryIsRecordedAndWarned(t *testing.T) {
-	c, err := New(validConfig())
+	config := validConfig()
+	warned := make(chan time.Time, 1)
+	config.OnTokenWillExpire = func(at time.Time) { warned <- at }
+	c, err := New(config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close(context.Background())
-	warned := make(chan time.Time, 1)
-	c.OnTokenWillExpire(func(at time.Time) { warned <- at })
 	expires := time.Now().Add(100 * time.Millisecond).UnixMilli()
 	payload := []byte(`{"token":"rotated","expires_in":` + fmt.Sprint(expires) + `}`)
 	c.acceptProvision(&internalprotocol.Provision{AuthToken: payload})

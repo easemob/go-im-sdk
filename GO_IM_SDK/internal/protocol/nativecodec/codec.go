@@ -1,4 +1,4 @@
-//go:build !gopbcodec && cgo && ((linux && (arm64 || amd64)) || (nativecodecdev && darwin && (arm64 || amd64)))
+//go:build cgo && ((linux && (arm64 || amd64)) || (nativecodecdev && darwin && (arm64 || amd64)))
 
 package nativecodec
 
@@ -14,16 +14,11 @@ package nativecodec
 import "C"
 
 import (
-	"bytes"
-	"compress/zlib"
 	"fmt"
-	"io"
 	"sync"
 	"unsafe"
 
 	"github.com/easemob/go-im-sdk/internal/protocol"
-	"github.com/easemob/go-im-sdk/pb"
-	"google.golang.org/protobuf/proto"
 )
 
 type Codec struct {
@@ -363,33 +358,6 @@ func (c *Codec) DecodeFrame(data []byte) (*protocol.Frame, error) {
 	return decodeFrame(f), nil
 }
 
-func decompressEnvelopePayload(data []byte) ([]byte, error) {
-	var m pb.MSync
-	if err := proto.Unmarshal(data, &m); err != nil {
-		return nil, fmt.Errorf("unmarshal envelope: %w", err)
-	}
-	if m.GetCompressAlgorimth() == 0 {
-		return data, nil
-	}
-	if m.GetCompressAlgorimth() != 1 {
-		return nil, fmt.Errorf("unsupported payload compression algorithm %d", m.GetCompressAlgorimth())
-	}
-	r, err := zlib.NewReader(bytes.NewReader(m.GetPayload()))
-	if err != nil {
-		return nil, fmt.Errorf("open zlib payload: %w", err)
-	}
-	payload, readErr := io.ReadAll(io.LimitReader(r, 16<<20))
-	closeErr := r.Close()
-	if readErr != nil {
-		return nil, fmt.Errorf("read zlib payload: %w", readErr)
-	}
-	if closeErr != nil {
-		return nil, fmt.Errorf("close zlib payload: %w", closeErr)
-	}
-	m.Payload = payload
-	m.CompressAlgorimth = proto.Uint32(0)
-	return proto.Marshal(&m)
-}
 func decodeFrame(f *C.EMCodecFrame) *protocol.Frame {
 	out := &protocol.Frame{Command: protocol.Command(C.em_codec_frame_command(f)), TraceID: uint64(C.em_codec_frame_trace_id(f))}
 	st := readStatus(f)

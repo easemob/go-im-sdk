@@ -298,7 +298,10 @@ func (r *connectionRun) completeACK(d *internalprotocol.Sync) {
 		ch <- ackResult{err: protocolError("send ack", int32(d.Status.Code), d.Status.Reason)}
 		return
 	}
-	ch <- ackResult{result: &SendResult{ClientMessageID: d.MetaID, ServerMessageID: d.ServerID, ServerTimestamp: d.Timestamp}}
+	ch <- ackResult{result: &SendResult{
+		MessageID: d.ServerID, ClientMessageID: d.MetaID,
+		ServerMessageID: d.ServerID, ServerTimestamp: d.Timestamp,
+	}}
 }
 func (r *connectionRun) cancelPending(cause error) {
 	r.pendingMu.Lock()
@@ -313,7 +316,12 @@ func (c *Client) Send(ctx context.Context, req SendRequest) (*SendResult, error)
 	c.mu.RLock()
 	r := c.run
 	connected := c.connState == ConnStateConnected
+	loginState := c.state
+	userID := c.userID
 	c.mu.RUnlock()
+	if loginState == LoginStateLogout || loginState == LoginStateLoggingIn {
+		return nil, newError(ErrNotLoggedIn, "send", "call Login successfully before Send")
+	}
 	if !connected || r == nil {
 		return nil, newError(ErrNotConnected, "send", "")
 	}
@@ -321,7 +329,7 @@ func (c *Client) Send(ctx context.Context, req SendRequest) (*SendResult, error)
 	if id == 0 {
 		id = c.nextMessageID()
 	}
-	meta, err := buildSendMeta(c, req, id)
+	meta, err := buildSendMeta(c, userID, req, id)
 	if err != nil {
 		return nil, err
 	}

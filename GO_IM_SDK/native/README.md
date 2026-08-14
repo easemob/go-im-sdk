@@ -1,14 +1,12 @@
 # Native MSync codec
 
-This internal target packages the C-only codec ABI, the generated C++ protocol
-implementation, and its namespaced protobuf-lite runtime. SDK consumers do not
-install protobuf or protoc.
+This target packages the C-only codec ABI and prebuilt native archives. The
+generated C++ protocol implementation and namespaced protobuf-lite runtime are
+linked into those archives; SDK consumers do not install protobuf or protoc.
 
-Developer build:
-
-```sh
-./scripts/build-native-codec.sh
-```
+The public repository contains prebuilt release archives only. Native codec
+source and the protocol schema are maintained in the private codec build
+project and are intentionally not part of this repository.
 
 macOS output is only for local ABI/codec validation. Release archives must be
 built and tested on the intended Linux amd64/arm64 glibc baseline. The current

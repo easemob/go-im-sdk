@@ -6,25 +6,65 @@ import (
 	"testing"
 
 	internalprotocol "github.com/easemob/go-im-sdk/internal/protocol"
-	"github.com/easemob/go-im-sdk/internal/protocol/gopb"
-	"github.com/easemob/go-im-sdk/pb"
-	"google.golang.org/protobuf/proto"
 )
+
+type messageTestCodec struct {
+	encoded internalprotocol.MessageBody
+	decoded *internalprotocol.MessageBody
+}
+
+func (c *messageTestCodec) EncodeProvision(internalprotocol.ProvisionRequest) ([]byte, error) {
+	return nil, nil
+}
+func (c *messageTestCodec) EncodeUnread() ([]byte, error) { return nil, nil }
+func (c *messageTestCodec) EncodeSync(internalprotocol.SyncRequest) ([]byte, error) {
+	return nil, nil
+}
+func (c *messageTestCodec) EncodeLogout(internalprotocol.LogoutRequest) ([]byte, error) {
+	return nil, nil
+}
+func (c *messageTestCodec) DecodeFrame([]byte) (*internalprotocol.Frame, error) { return nil, nil }
+func (c *messageTestCodec) EncodeMessageBody(body internalprotocol.MessageBody) ([]byte, error) {
+	c.encoded = body
+	return []byte("test-payload"), nil
+}
+func (c *messageTestCodec) DecodeMessageBody([]byte) (*internalprotocol.MessageBody, error) {
+	return c.decoded, nil
+}
+func (c *messageTestCodec) DecodeStatistic([]byte) (*internalprotocol.Statistic, error) {
+	return nil, nil
+}
+
+var _ internalprotocol.Codec = (*messageTestCodec)(nil)
 
 func TestBuildOutgoingMeta(t *testing.T) {
 	tests := []struct {
 		name       string
 		req        SendRequest
-		wantType   pb.MessageBody_Type
-		wantRoute  pb.Meta_RouteType
+		wantKind   internalprotocol.MessageKind
+		wantRoute  internalprotocol.RouteType
 		wantDomain string
 	}{
-		{"chat", SendRequest{ClientMessageID: 42, To: "bob", Body: MessageBody{Type: MessageBodyText, Text: "hello"}}, pb.MessageBody_CHAT, pb.Meta_ROUTE_ALL, ""},
-		{"group directed", SendRequest{To: "group-1", IsGroup: true, DirectedUsers: []string{"bob", "cara"}, Body: MessageBody{Type: MessageBodyCustom, Event: "alert", CustomExts: map[string]KeyValue{"color": {Type: KeyValueString, Value: "red"}}}}, pb.MessageBody_GROUPCHAT, pb.Meta_ROUTE_DIRECT, "conference.easemob.com"},
+		{
+			name: "chat",
+			req: SendRequest{ClientMessageID: 42, To: "bob", Body: MessageBody{
+				Type: MessageBodyText, Text: "hello",
+			}},
+			wantKind: internalprotocol.MessageChat, wantRoute: internalprotocol.RouteAll,
+		},
+		{
+			name: "group directed",
+			req: SendRequest{To: "group-1", IsGroup: true, DirectedUsers: []string{"bob", "cara"}, Body: MessageBody{
+				Type: MessageBodyCustom, Event: "alert",
+				CustomExts: map[string]KeyValue{"color": {Type: KeyValueString, Value: "red"}},
+			}},
+			wantKind: internalprotocol.MessageGroupChat, wantRoute: internalprotocol.RouteDirect,
+			wantDomain: "conference.easemob.com",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			codec := gopb.New()
+			codec := &messageTestCodec{}
 			meta, err := buildOutgoingMeta(codec, "org#app", "alice", "easemob.com", "go", tt.req)
 			if err != nil {
 				t.Fatal(err)
@@ -35,60 +75,141 @@ func TestBuildOutgoingMeta(t *testing.T) {
 			if meta.ID == 0 {
 				t.Fatal("generated id is zero")
 			}
-			if meta.Namespace != internalprotocol.NamespaceChat || int32(meta.Route) != int32(tt.wantRoute) {
+			if meta.Namespace != internalprotocol.NamespaceChat || meta.Route != tt.wantRoute {
 				t.Fatalf("routing: %+v", meta)
 			}
-			// Meta.to：携带 appkey；单聊无 domain，群聊带 conference.<domain>。
 			if meta.To.Name != tt.req.To || meta.To.AppKey != "org#app" || meta.To.Domain != tt.wantDomain {
 				t.Fatalf("meta.to=%+v want domain=%q", meta.To, tt.wantDomain)
 			}
 			if got := meta.DirectedUsers; len(got) != len(tt.req.DirectedUsers) {
 				t.Fatalf("directed users=%v", got)
 			}
-			var body pb.MessageBody
-			if err := proto.Unmarshal(meta.Payload, &body); err != nil {
-				t.Fatal(err)
+			if codec.encoded.Kind != tt.wantKind || codec.encoded.To.Name != tt.req.To {
+				t.Fatalf("body=%+v", codec.encoded)
 			}
-			if body.GetType() != tt.wantType || body.GetTo().GetName() != tt.req.To {
-				t.Fatalf("body=%+v", &body)
-			}
-			if body.UserinfoUpdateTime != nil {
-				t.Fatal("userinfo_update_time must not be sent")
+			if codec.encoded.From.Name != "alice" {
+				t.Fatalf("body.from=%+v", codec.encoded.From)
 			}
 		})
 	}
 }
 
 func TestBuildOutgoingMetaValidation(t *testing.T) {
-	codec := gopb.New()
-	if _, err := buildOutgoingMeta(codec, "a", "u", "d", "r", SendRequest{To: "g", DirectedUsers: []string{"u"}, Body: MessageBody{Type: MessageBodyText}}); err == nil {
+	codec := &messageTestCodec{}
+	if _, err := buildOutgoingMeta(codec, "a", "u", "d", "r", SendRequest{
+		To: "g", DirectedUsers: []string{"u"}, Body: MessageBody{Type: MessageBodyText},
+	}); err == nil {
 		t.Fatal("expected directed non-group error")
 	}
-	if _, err := buildOutgoingMeta(codec, "a", "u", "d", "r", SendRequest{To: "u", Body: MessageBody{Type: MessageBodyCommand, Params: map[string]KeyValue{"n": {Type: KeyValueInt, Value: int64(1)}}}}); err == nil {
+	if _, err := buildOutgoingMeta(codec, "a", "u", "d", "r", SendRequest{
+		To: "u", Body: MessageBody{Type: MessageBodyCommand, Params: map[string]KeyValue{
+			"n": {Type: KeyValueInt, Value: int64(1)},
+		}},
+	}); err == nil {
 		t.Fatal("expected non-string outgoing KeyValue error")
 	}
 }
 
-func TestParseIncomingMessagePreservesTypedKeyValues(t *testing.T) {
-	command := pb.MessageBody_Content_COMMAND
-	messageType := pb.MessageBody_GROUPCHAT
-	values := []*pb.KeyValue{
-		wireVarint("bool", pb.KeyValue_BOOL, 1),
-		wireVarint("int", pb.KeyValue_INT, -7),
-		wireVarint("uint", pb.KeyValue_UINT, -1),
-		wireVarint("long", pb.KeyValue_LLINT, math.MaxInt64),
-		wireFloat("float", 1.25),
-		wireDouble("double", 2.5),
-		wireString("string", pb.KeyValue_STRING, "value"),
-		wireString("json", pb.KeyValue_JSON_STRING, `{"a":1}`),
+func TestBuildOutgoingMetaEncodesTypedMessageExtInStableOrder(t *testing.T) {
+	codec := &messageTestCodec{}
+	req := SendRequest{
+		To: "bob",
+		Ext: map[string]KeyValue{
+			"h_json":   {Type: KeyValueJSONString, Value: `{"order_id":"123"}`},
+			"c_uint":   {Type: KeyValueUint, Value: uint64(math.MaxUint64)},
+			"a_bool":   {Type: KeyValueBool, Value: true},
+			"f_double": {Type: KeyValueDouble, Value: 2.5},
+			"e_float":  {Type: KeyValueFloat, Value: float32(1.25)},
+			"d_long":   {Type: KeyValueLong, Value: int64(math.MinInt64)},
+			"b_int":    {Type: KeyValueInt, Value: int(-7)},
+			"g_string": {Type: KeyValueString, Value: "value"},
+		},
+		Body: MessageBody{Type: MessageBodyCommand, Action: "run", Params: map[string]KeyValue{
+			"body-only": {Type: KeyValueString, Value: "param"},
+		}},
 	}
-	body := &pb.MessageBody{Type: &messageType, From: &pb.JID{Name: proto.String("alice")}, To: &pb.JID{Name: proto.String("group")}, Contents: []*pb.MessageBody_Content{{Type: &command, Action: proto.String("run"), Params: values}}, Ext: values}
-	payload, err := proto.Marshal(body)
-	if err != nil {
+	if _, err := buildOutgoingMeta(codec, "org#app", "alice", "easemob.com", "resource", req); err != nil {
 		t.Fatal(err)
 	}
-	meta := internalprotocol.Meta{ID: 99, Timestamp: 1234, Payload: payload}
-	got, err := parseIncomingMessage(gopb.New(), meta)
+	wantKeys := []string{"a_bool", "b_int", "c_uint", "d_long", "e_float", "f_double", "g_string", "h_json"}
+	if len(codec.encoded.Ext) != len(wantKeys) {
+		t.Fatalf("ext=%#v", codec.encoded.Ext)
+	}
+	for i, key := range wantKeys {
+		if codec.encoded.Ext[i].Key != key {
+			t.Fatalf("ext order=%#v", codec.encoded.Ext)
+		}
+	}
+	if got := codec.encoded.Ext; got[0].Kind != internalprotocol.KeyValueBool || !got[0].Bool ||
+		got[1].Kind != internalprotocol.KeyValueInt || got[1].Int64 != -7 ||
+		got[2].Kind != internalprotocol.KeyValueUint || got[2].Uint64 != math.MaxUint64 ||
+		got[3].Kind != internalprotocol.KeyValueLong || got[3].Int64 != math.MinInt64 ||
+		got[4].Kind != internalprotocol.KeyValueFloat || got[4].Float != 1.25 ||
+		got[5].Kind != internalprotocol.KeyValueDouble || got[5].Double != 2.5 ||
+		got[6].Kind != internalprotocol.KeyValueString || got[6].String != "value" ||
+		got[7].Kind != internalprotocol.KeyValueJSONString || got[7].String != `{"order_id":"123"}` {
+		t.Fatalf("typed ext=%#v", got)
+	}
+	if got := codec.encoded.Contents[0].Params; len(got) != 1 || got[0].Key != "body-only" {
+		t.Fatalf("command params mixed with message ext: %#v", got)
+	}
+}
+
+func TestBuildOutgoingMetaEmptyExtPreservesWireShape(t *testing.T) {
+	for name, ext := range map[string]map[string]KeyValue{"nil": nil, "empty": {}} {
+		t.Run(name, func(t *testing.T) {
+			codec := &messageTestCodec{}
+			_, err := buildOutgoingMeta(codec, "org#app", "alice", "easemob.com", "resource", SendRequest{
+				To: "bob", Ext: ext, Body: MessageBody{Type: MessageBodyText, Text: "hello"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if codec.encoded.Ext != nil {
+				t.Fatalf("empty ext encoded as %#v", codec.encoded.Ext)
+			}
+		})
+	}
+}
+
+func TestBuildOutgoingMetaRejectsInvalidMessageExt(t *testing.T) {
+	for name, value := range map[string]KeyValue{
+		"bool":    {Type: KeyValueBool, Value: "true"},
+		"int":     {Type: KeyValueInt, Value: 1.5},
+		"uint":    {Type: KeyValueUint, Value: -1},
+		"float":   {Type: KeyValueFloat, Value: 1},
+		"string":  {Type: KeyValueString, Value: 1},
+		"unknown": {Type: KeyValueType("future"), Value: "x"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			codec := &messageTestCodec{}
+			_, err := buildOutgoingMeta(codec, "org#app", "alice", "easemob.com", "resource", SendRequest{
+				To: "bob", Ext: map[string]KeyValue{"bad": value}, Body: MessageBody{Type: MessageBodyText},
+			})
+			if err == nil {
+				t.Fatal("expected message ext validation error")
+			}
+		})
+	}
+}
+
+func TestParseIncomingMessagePreservesTypedKeyValues(t *testing.T) {
+	values := []internalprotocol.KeyValue{
+		{Key: "bool", Kind: internalprotocol.KeyValueBool, Bool: true},
+		{Key: "int", Kind: internalprotocol.KeyValueInt, Int64: -7},
+		{Key: "uint", Kind: internalprotocol.KeyValueUint, Uint64: math.MaxUint64},
+		{Key: "long", Kind: internalprotocol.KeyValueLong, Int64: math.MaxInt64},
+		{Key: "float", Kind: internalprotocol.KeyValueFloat, Float: 1.25},
+		{Key: "double", Kind: internalprotocol.KeyValueDouble, Double: 2.5},
+		{Key: "string", Kind: internalprotocol.KeyValueString, String: "value"},
+		{Key: "json", Kind: internalprotocol.KeyValueJSONString, String: `{"a":1}`},
+	}
+	codec := &messageTestCodec{decoded: &internalprotocol.MessageBody{
+		Kind: internalprotocol.MessageGroupChat,
+		From: internalprotocol.JID{Name: "alice"}, To: internalprotocol.JID{Name: "group"}, Ext: values,
+		Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentCommand, Action: "run", Params: values}},
+	}}
+	got, err := parseIncomingMessage(codec, internalprotocol.Meta{ID: 99, Timestamp: 1234, Payload: []byte("payload")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,6 +218,10 @@ func TestParseIncomingMessagePreservesTypedKeyValues(t *testing.T) {
 	}
 	if got.Ext["bool"].Value != true || got.Ext["uint"].Value != uint64(math.MaxUint64) || got.Ext["long"].Value != int64(math.MaxInt64) {
 		t.Fatalf("ext=%#v", got.Ext)
+	}
+	if got.Ext["int"].Value != int64(-7) || got.Ext["float"].Value != float64(float32(1.25)) ||
+		got.Ext["double"].Value != 2.5 || got.Ext["string"].Value != "value" || got.Ext["json"].Value != `{"a":1}` {
+		t.Fatalf("typed ext=%#v", got.Ext)
 	}
 	if got.Bodies[0].Type != MessageBodyCommand || got.Bodies[0].Action != "run" {
 		t.Fatalf("body=%+v", got.Bodies[0])
@@ -126,11 +251,11 @@ func TestKeyValueJSON64BitIntegersAreStrings(t *testing.T) {
 }
 
 func TestUnknownBodyDoesNotFailMessage(t *testing.T) {
-	unknown := pb.MessageBody_Content_Type(99)
-	messageType := pb.MessageBody_CHAT
-	body := &pb.MessageBody{Type: &messageType, Contents: []*pb.MessageBody_Content{{Type: &unknown, Text: proto.String("future")}}}
-	payload, _ := proto.Marshal(body)
-	got, err := parseIncomingMessage(gopb.New(), internalprotocol.Meta{Payload: payload})
+	codec := &messageTestCodec{decoded: &internalprotocol.MessageBody{
+		Kind:     internalprotocol.MessageChat,
+		Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentKind(99), RawPayload: []byte("future")}},
+	}}
+	got, err := parseIncomingMessage(codec, internalprotocol.Meta{Payload: []byte("payload")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,19 +276,4 @@ func TestGeneratedClientMessageIDsAreUnique(t *testing.T) {
 		}
 		seen[id] = struct{}{}
 	}
-}
-
-func wireVarint(key string, typ pb.KeyValue_ValueType, value int64) *pb.KeyValue {
-	return &pb.KeyValue{Key: proto.String(key), Type: &typ, Value: &pb.KeyValue_VarintValue{VarintValue: value}}
-}
-func wireFloat(key string, value float32) *pb.KeyValue {
-	typ := pb.KeyValue_FLOAT
-	return &pb.KeyValue{Key: proto.String(key), Type: &typ, Value: &pb.KeyValue_FloatValue{FloatValue: value}}
-}
-func wireDouble(key string, value float64) *pb.KeyValue {
-	typ := pb.KeyValue_DOUBLE
-	return &pb.KeyValue{Key: proto.String(key), Type: &typ, Value: &pb.KeyValue_DoubleValue{DoubleValue: value}}
-}
-func wireString(key string, typ pb.KeyValue_ValueType, value string) *pb.KeyValue {
-	return &pb.KeyValue{Key: proto.String(key), Type: &typ, Value: &pb.KeyValue_StringValue{StringValue: value}}
 }

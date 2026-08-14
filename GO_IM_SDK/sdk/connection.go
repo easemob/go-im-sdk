@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"math/rand"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,20 +57,31 @@ type connectionRun struct {
 
 func (c *Client) isClosed() bool { c.mu.RLock(); defer c.mu.RUnlock(); return c.closed }
 
-func (c *Client) Connect(ctx context.Context) error {
+func (c *Client) Login(ctx context.Context, userID, token string) error {
+	if strings.TrimSpace(userID) == "" {
+		return newError(ErrNotLoggedIn, "login", "user ID is empty")
+	}
+	if strings.TrimSpace(token) == "" {
+		return newError(ErrNotLoggedIn, "login", "token is empty")
+	}
 	c.connectMu.Lock()
 	defer c.connectMu.Unlock()
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return newError(ErrClientClosed, "connect", "")
+		return newError(ErrClientClosed, "login", "")
 	}
 	if c.state != LoginStateLogout {
 		c.mu.Unlock()
-		return fmt.Errorf("client is already active")
+		return newError(ErrAlreadyLoggedIn, "login", "client is already active")
 	}
 	c.state = LoginStateLoggingIn
 	c.connState = ConnStateConnecting
+	c.userID = userID
+	c.token = token
+	c.lastErr = nil
+	c.tokenExpiresAt = time.Time{}
+	c.backoffAttempt.Store(0)
 	cb := c.callbacks.connection
 	c.mu.Unlock()
 	if cb != nil {
@@ -80,7 +91,16 @@ func (c *Client) Connect(ctx context.Context) error {
 	defer cancel()
 	stopLifecycleCancel := context.AfterFunc(c.eventCtx, cancel)
 	defer stopLifecycleCancel()
-	r, err := c.connectWithRedirects(connectCtx, c.cfg.MsyncHost)
+	msyncHost, restBase, err := c.resolveLoginEndpoints(connectCtx)
+	if err != nil {
+		c.recordTerminal(err)
+		return err
+	}
+	c.mu.Lock()
+	c.msyncHost = msyncHost
+	c.restBase = restBase
+	c.mu.Unlock()
+	r, err := c.connectWithRedirects(connectCtx, msyncHost)
 	if err != nil {
 		c.recordTerminal(err)
 		return err
@@ -88,8 +108,8 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		r.shutdown(newError(ErrClientClosed, "connect", "closed while connecting"))
-		return newError(ErrClientClosed, "connect", "")
+		r.shutdown(newError(ErrClientClosed, "login", "closed while connecting"))
+		return newError(ErrClientClosed, "login", "")
 	}
 	c.run = r
 	c.state = LoginStateLoggedIn
@@ -164,7 +184,7 @@ func (c *Client) dial(ctx context.Context, endpoint string) (*connectionRun, err
 func (r *connectionRun) login(ctx context.Context) (*internalprotocol.Provision, error) {
 	token := r.client.tokenValue()
 	auth, _ := json.Marshal(map[string]string{"token": token})
-	frame, err := r.client.codec.EncodeProvision(internalprotocol.ProvisionRequest{User: r.client.jid(r.client.cfg.UserID), SDKVersion: r.client.cfg.SDKVersion, Resource: r.client.cfg.Resource, AuthToken: auth})
+	frame, err := r.client.codec.EncodeProvision(internalprotocol.ProvisionRequest{User: r.client.jid(r.client.currentUserID()), SDKVersion: sdkVersion, Resource: r.client.cfg.Resource, AuthToken: auth})
 	if err != nil {
 		return nil, err
 	}
@@ -183,6 +203,12 @@ func (r *connectionRun) login(ctx context.Context) (*internalprotocol.Provision,
 
 func (c *Client) jid(name string) internalprotocol.JID {
 	return internalprotocol.JID{AppKey: c.cfg.AppKey, Name: name, Domain: c.cfg.Domain, ClientResource: c.cfg.Resource}
+}
+
+func (c *Client) currentUserID() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.userID
 }
 
 func (r *connectionRun) sendFrame(ctx context.Context, frame []byte) error {
@@ -280,7 +306,7 @@ func (r *connectionRun) dispatch(frame *internalprotocol.Frame) {
 		}
 		if st.Code == internalprotocol.StatusOK {
 			if r.client.debug {
-				r.client.logger.Debug("wss.provision_ok", "configured_user", r.client.cfg.UserID,
+				r.client.logger.Debug("wss.provision_ok", "configured_user", r.client.currentUserID(),
 					"configured_resource", r.client.cfg.Resource, "session_id", p.SessionID,
 					"auth_token_bytes", len(p.AuthToken))
 			}
@@ -502,24 +528,34 @@ func (c *Client) monitor(r *connectionRun) {
 		return
 	}
 	if isTerminal(err) || c.cfg.DisableReconnect {
-		c.recordTerminal(err)
+		c.recordTerminalForRun(r, err)
 		return
 	}
 	go c.reconnect(r)
 }
 
 func (c *Client) reconnect(old *connectionRun) {
-	c.setStates(LoginStateReconnecting, ConnStateReconnecting)
-	endpoint := c.cfg.MsyncHost
-	c.mu.RLock()
+	c.mu.Lock()
+	if c.closed || c.run != old || c.state == LoginStateLogout {
+		c.mu.Unlock()
+		return
+	}
+	changed := c.connState != ConnStateReconnecting
+	c.state = LoginStateReconnecting
+	c.connState = ConnStateReconnecting
+	stateCallback := c.callbacks.connection
+	endpoint := c.msyncHost
 	lastErr := c.lastErr
-	c.mu.RUnlock()
+	c.mu.Unlock()
+	if changed && stateCallback != nil {
+		c.emit(func() { stateCallback(ConnStateReconnecting) })
+	}
 	var redirect *redirectError
 	if errors.As(lastErr, &redirect) {
 		if next, err := redirectURL(old.endpoint, redirect.info); err == nil {
 			endpoint = next
 		} else {
-			c.recordTerminal(err)
+			c.recordTerminalForRun(old, err)
 			return
 		}
 	}
@@ -532,8 +568,9 @@ func (c *Client) reconnect(old *connectionRun) {
 		c.backoffAttempt.Store(uint32(attempt))
 		c.mu.RLock()
 		closed := c.closed
+		current := c.run == old && c.state == LoginStateReconnecting
 		c.mu.RUnlock()
-		if closed {
+		if closed || !current {
 			return
 		}
 		timer := time.NewTimer(reconnectDelay(attempt))
@@ -548,7 +585,10 @@ func (c *Client) reconnect(old *connectionRun) {
 			}
 			return
 		}
-		if c.isClosed() {
+		c.mu.RLock()
+		current = c.run == old && c.state == LoginStateReconnecting
+		c.mu.RUnlock()
+		if c.isClosed() || !current {
 			return
 		}
 		c.connectMu.Lock()
@@ -564,7 +604,7 @@ func (c *Client) reconnect(old *connectionRun) {
 			c.lastErr = err
 			c.mu.Unlock()
 			if isTerminal(err) {
-				c.recordTerminal(err)
+				c.recordTerminalForRun(old, err)
 				return
 			}
 			continue
@@ -612,10 +652,29 @@ func isTerminal(err error) bool {
 }
 
 func (c *Client) recordTerminal(err error) {
+	c.recordTerminalForRun(nil, err)
+}
+
+func (c *Client) recordTerminalForRun(expected *connectionRun, err error) {
 	c.mu.Lock()
+	if expected != nil && c.run != expected {
+		c.mu.Unlock()
+		return
+	}
 	c.lastErr = err
 	c.state = LoginStateLogout
 	c.connState = ConnStateDisconnected
+	c.run = nil
+	c.sessionID = ""
+	c.userID = ""
+	c.token = ""
+	c.msyncHost = ""
+	c.restBase = ""
+	c.tokenExpiresAt = time.Time{}
+	if c.tokenWarningCancel != nil {
+		c.tokenWarningCancel()
+		c.tokenWarningCancel = nil
+	}
 	cb := c.callbacks.disconnect
 	c.mu.Unlock()
 	c.fireErrorCallback(err)
@@ -653,11 +712,19 @@ func (c *Client) Close(ctx context.Context) error {
 		c.tokenWarningCancel = nil
 	}
 	r := c.run
+	c.run = nil
+	c.state = LoginStateLogout
+	c.connState = ConnStateDisconnected
+	c.sessionID = ""
+	c.userID = ""
+	c.token = ""
+	c.msyncHost = ""
+	c.restBase = ""
+	c.tokenExpiresAt = time.Time{}
 	c.mu.Unlock()
 	if r != nil {
 		r.shutdown(newError(ErrClientClosed, "close", ""))
 	}
-	c.setStates(LoginStateLogout, ConnStateDisconnected)
 	// Wait until an in-flight initial/reconnect handshake has stopped before
 	// destroying the shared native codec handle.
 	c.connectMu.Lock()
@@ -665,24 +732,42 @@ func (c *Client) Close(ctx context.Context) error {
 	if closer, ok := c.codec.(interface{ Close() }); ok {
 		closer.Close()
 	}
-	c.mu.Lock()
-	if c.run == r {
-		c.run = nil
-	}
-	c.sessionID = ""
-	c.mu.Unlock()
 	// Do not wait for eventWG here: a callback is allowed to call Close, and
 	// waiting from the dispatcher goroutine would deadlock on itself.
 	return nil
 }
 
 func (c *Client) Logout(ctx context.Context) error {
-	c.mu.RLock()
+	c.connectMu.Lock()
+	defer c.connectMu.Unlock()
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return newError(ErrClientClosed, "logout", "")
+	}
 	r := c.run
 	session := c.sessionID
-	c.mu.RUnlock()
+	wasConnected := c.connState != ConnStateDisconnected
+	c.run = nil
+	c.state = LoginStateLogout
+	c.connState = ConnStateDisconnected
+	c.sessionID = ""
+	c.userID = ""
+	c.msyncHost = ""
+	c.restBase = ""
+	c.tokenExpiresAt = time.Time{}
+	if c.tokenWarningCancel != nil {
+		c.tokenWarningCancel()
+		c.tokenWarningCancel = nil
+	}
+	c.token = ""
+	stateCallback := c.callbacks.connection
+	c.mu.Unlock()
 	if r == nil {
-		return c.Close(ctx)
+		if wasConnected && stateCallback != nil {
+			c.emit(func() { stateCallback(ConnStateDisconnected) })
+		}
+		return nil
 	}
 	frame, err := c.codec.EncodeLogout(internalprotocol.LogoutRequest{SessionID: session, Reason: "client logout"})
 	if err == nil {
@@ -706,7 +791,10 @@ func (c *Client) Logout(ctx context.Context) error {
 		default:
 		}
 	}
-	_ = c.Close(context.Background())
+	r.shutdown(newError(ErrStreamClosed, "logout", "session ended"))
+	if wasConnected && stateCallback != nil {
+		c.emit(func() { stateCallback(ConnStateDisconnected) })
+	}
 	return err
 }
 

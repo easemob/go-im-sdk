@@ -25,15 +25,12 @@ const (
 )
 
 type fileConfig struct {
-	MsyncHost                 string
-	RestBase                  string
 	AppKey                    string
 	UserID                    string
 	Token                     string
 	TokenFile                 string
 	Domain                    string
 	Resource                  string
-	SDKVersion                string
 	HeartbeatIntervalSeconds  int
 	HeartbeatTimeoutSeconds   int
 	DisableReconnect          bool
@@ -66,14 +63,9 @@ func main() {
 	}
 
 	client, err := imsdk.New(imsdk.Config{
-		MsyncHost:                fc.MsyncHost,
-		RestBase:                 fc.RestBase,
 		AppKey:                   fc.AppKey,
-		UserID:                   fc.UserID,
-		Token:                    fc.Token,
 		Domain:                   fc.Domain,
 		Resource:                 fc.Resource,
-		SDKVersion:               fc.SDKVersion,
 		HeartbeatInterval:        seconds(fc.HeartbeatIntervalSeconds),
 		HeartbeatTimeout:         seconds(fc.HeartbeatTimeoutSeconds),
 		ConnectTimeout:           seconds(fc.ConnectTimeoutSeconds),
@@ -94,22 +86,36 @@ func main() {
 			logger.Info("message received", "meta_id", msg.MetaID, "from", msg.From, "is_group", msg.IsGroup)
 			return nil
 		},
+		OnConnectionStateChanged: func(state imsdk.ConnState) {
+			logger.Info("IM connection state changed", "state", state.String())
+		},
+		OnDisconnect:   func(err error) { logger.Warn("IM session disconnected", "error", err) },
+		OnTokenExpired: func() { logger.Warn("IM token expired") },
+		OnTokenWillExpire: func(expiresAt time.Time) {
+			logger.Warn("IM token will expire", "expires_at", expiresAt.UTC().Format(time.RFC3339))
+		},
+		OnTokenRotated: func(_ string, expiresIn int64) {
+			logger.Info("IM token rotated", "expires_in", expiresIn)
+		},
+		OnUserForbidden: func() { logger.Warn("IM user forbidden") },
+		OnUserRemoved:   func() { logger.Warn("IM user removed") },
+		OnUserKickedByOtherDevice: func(device, reason string) {
+			logger.Warn("IM user kicked by other device", "device", device, "reason", reason)
+		},
+		OnUserLoginAnotherDevice: func(device, reason string) {
+			logger.Warn("IM user logged in on another device", "device", device, "reason", reason)
+		},
+		OnServerNotice: func(kind string, payload []byte) {
+			logger.Info("IM server notice", "kind", kind, "payload_bytes", len(payload))
+		},
 	})
 	if err != nil {
 		logger.Error("SDK configuration rejected", "error", err)
 		os.Exit(2)
 	}
 
-	client.OnDisconnect(func(err error) { logger.Warn("IM session disconnected", "error", err) })
-	client.OnTokenExpired(func() { logger.Warn("IM token expired") })
-	client.OnTokenWillExpire(func(expiresAt time.Time) {
-		logger.Warn("IM token will expire", "expires_at", expiresAt.UTC().Format(time.RFC3339))
-	})
-	client.OnUserForbidden(func() { logger.Warn("IM user forbidden") })
-	client.OnUserRemoved(func() { logger.Warn("IM user removed") })
-
 	connectCtx, cancelConnect := context.WithTimeout(context.Background(), durationOr(fc.ConnectTimeoutSeconds, 15))
-	err = client.Connect(connectCtx)
+	err = client.Login(connectCtx, fc.UserID, fc.Token)
 	cancelConnect()
 	if err != nil {
 		logger.Error("login failed", "error", err)
@@ -163,8 +169,8 @@ func loadConfig(path string) (fileConfig, error) {
 		return fileConfig{}, err
 	}
 	known := map[string]bool{
-		"msync_host": true, "rest_base": true, "app_key": true, "user_id": true,
-		"token": true, "token_file": true, "domain": true, "resource": true, "sdk_version": true,
+		"app_key": true, "user_id": true,
+		"token": true, "token_file": true, "domain": true, "resource": true,
 		"heartbeat_interval_seconds": true, "heartbeat_timeout_seconds": true, "disable_reconnect": true,
 		"connect_timeout_seconds": true, "send_timeout_seconds": true, "logout_timeout_seconds": true,
 		"max_redirect_hops": true, "max_frame_bytes": true, "write_queue_size": true,
@@ -178,9 +184,9 @@ func loadConfig(path string) (fileConfig, error) {
 	}
 
 	fc := fileConfig{
-		MsyncHost: values["msync_host"], RestBase: values["rest_base"], AppKey: values["app_key"],
+		AppKey: values["app_key"],
 		UserID: values["user_id"], Token: values["token"], TokenFile: values["token_file"],
-		Domain: values["domain"], Resource: values["resource"], SDKVersion: values["sdk_version"],
+		Domain: values["domain"], Resource: values["resource"],
 	}
 	if envToken := strings.TrimSpace(os.Getenv(tokenEnv)); envToken != "" {
 		fc.Token = envToken

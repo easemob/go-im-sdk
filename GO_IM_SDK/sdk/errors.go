@@ -21,6 +21,8 @@ const (
 	ErrHandshake          ErrorCode = "HANDSHAKE_ERROR"
 	ErrIO                 ErrorCode = "IO_ERROR"
 	ErrNotConnected       ErrorCode = "NOT_CONNECTED"
+	ErrNotLoggedIn        ErrorCode = "NOT_LOGGED_IN"
+	ErrAlreadyLoggedIn    ErrorCode = "ALREADY_LOGGED_IN"
 	ErrClientClosed       ErrorCode = "CLIENT_CLOSED"
 	ErrWriteBackpressure  ErrorCode = "WRITE_BACKPRESSURE"
 	ErrInvalidToken       ErrorCode = "INVALID_TOKEN"

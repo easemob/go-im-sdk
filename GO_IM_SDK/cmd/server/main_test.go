@@ -14,7 +14,7 @@ func TestLoadConfigTokenPriority(t *testing.T) {
 		t.Fatal(err)
 	}
 	config := filepath.Join(dir, "config.yaml")
-	body := "msync_host: \"wss://example.test/websocket\"\nrest_base: \"https://example.test/org/app\"\napp_key: \"org#app\"\nuser_id: bot\ntoken_file: \"" + secret + "\"\ntoken: yaml-token\n"
+	body := "app_key: \"org#app\"\nuser_id: bot\nresource: server-01\ntoken_file: \"" + secret + "\"\ntoken: yaml-token\n"
 	if err := os.WriteFile(config, []byte(body), 0644); err != nil {
 		t.Fatal(err)
 	}

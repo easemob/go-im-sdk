@@ -87,7 +87,7 @@
 ### 3.3 [P0] C++ 节点预算无符号下溢
 
 **问题**
-`native/src/codec.cpp` 的 `valid_message_budget` 与 `em_codec_decode_frame` 内层循环中，对单 content 的 KV 数量做预算检查时：
+私有 native codec 实现的 `valid_message_budget` 与 `em_codec_decode_frame` 内层循环中，对单 content 的 KV 数量做预算检查时：
 
 ```cpp
 size_t values = c.params_size() + c.customexts_size();
@@ -96,7 +96,7 @@ if (nodes > 4096u - values) return false;   // values 未预先 <=4096 校验
 
 `values` 来自解析后的 protobuf，未像编码侧 `valid_request_budget` 那样先做 `valid_count` 校验。单个 content 的 KV 数超过 4096 时，`4096u - values` 下溢为巨大数，检查被绕过，节点预算（4096）失效。虽仍有 16MiB 输入上限兜底，不构成内存安全崩溃，但削弱了畸形输入的 DoS 防线。
 
-**修复**（`native/src/codec.cpp`）
+**修复**（私有 native codec 构建工程）
 
 ```cpp
 if (values > 4096u || nodes > 4096u - values) return false;
@@ -187,9 +187,8 @@ if (values > 4096u || nodes > 4096u - values) return false;
 | `go build ./...` | 通过 |
 | `go vet ./...` | 通过 |
 | `go test -race ./...` | 通过 |
-| `c++ -std=c++11 -Wall` 编译 `codec.cpp` | 通过（仅 protobuf 2.6.1 OSAtomic 弃用告警） |
 | `gofmt -l sdk/ internal/protocol/native/` | 无输出（格式正确） |
-| `CGO_ENABLED=1 GOARCH=arm64 go build -tags nativecodec`（native 适配器） | 通过 |
+| `CGO_ENABLED=1 GOARCH=arm64 go test -tags nativecodecdev ./...`（native 适配器） | 通过 |
 
 ---
 

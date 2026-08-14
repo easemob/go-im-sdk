@@ -11,7 +11,7 @@
 #   ./scripts/test-directed-message.sh
 #
 # 可通过环境变量覆盖：
-#   LXM_CONFIG / LXM2_CONFIG / XU_CONFIG / GROUP_NAME / DIRECTED_USER / DIRECTED_TEXT
+#   LXM_CONFIG / LXM2_CONFIG / XU_CONFIG / GROUP_NAME / DIRECTED_USER / DIRECTED_TEXT / DIRECTED_EXT
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,6 +23,7 @@ XU_CONFIG="${XU_CONFIG:-$ROOT/prod-xu.yaml}"
 GROUP_NAME="${GROUP_NAME:-go-sdk-directed-test}"
 DIRECTED_USER="${DIRECTED_USER:-lxm2}"
 DIRECTED_TEXT="${DIRECTED_TEXT:-directed hello from lxm}"
+DIRECTED_EXT="${DIRECTED_EXT:-trace_id=directed-demo}"
 
 LXM_LOG="$ROOT/test-lxm.log"
 LXM_SEND_LOG="$ROOT/test-lxm-send.log"
@@ -69,17 +70,55 @@ case "$DIRECTED_USER" in
         ;;
 esac
 
+# The acceptance check derives its expected message-level Ext from the first
+# configured key=value pair.  The default is deliberately a simple string so
+# the check has no jq/Python dependency and remains portable across the Linux
+# and macOS environments supported by this script.
+DIRECTED_EXT_FIRST="${DIRECTED_EXT%%,*}"
+case "$DIRECTED_EXT_FIRST" in
+    *=*)
+        DIRECTED_EXT_KEY=$(printf '%s' "${DIRECTED_EXT_FIRST%%=*}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        DIRECTED_EXT_VALUE=$(printf '%s' "${DIRECTED_EXT_FIRST#*=}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        ;;
+    *)
+        log "FAIL DIRECTED_EXT 必须至少包含一个 key=value"
+        exit 2
+        ;;
+esac
+if [ -z "$DIRECTED_EXT_KEY" ]; then
+    log "FAIL DIRECTED_EXT 的首个 key 不能为空"
+    exit 2
+fi
+
 log "=============================================="
 log "群聊定向消息端到端测试"
 log_diag "lxm  配置: $LXM_CONFIG"
 log_diag "lxm2 配置: $LXM2_CONFIG"
 log_diag "xu   配置: $XU_CONFIG"
 log_diag "群名: $GROUP_NAME  定向用户: $DIRECTED_USER  文本: $DIRECTED_TEXT"
+log_diag "消息 Ext: key=$DIRECTED_EXT_KEY  value_bytes=${#DIRECTED_EXT_VALUE}"
 log "=============================================="
 
-log "构建 demo 二进制（gopbcodec）"
+log "构建 demo 二进制（native codec）"
 mkdir -p "$ROOT/bin"
-(cd "$ROOT" && go build -tags gopbcodec -o "$BIN" ./cmd/integration-demo)
+BUILD_TAGS="${GO_IM_SDK_BUILD_TAGS:-}"
+if [ -z "$BUILD_TAGS" ] && [ "$(uname -s)" = "Darwin" ]; then
+    BUILD_TAGS="nativecodecdev"
+fi
+if [ "$(uname -s)" = "Darwin" ]; then
+    if [ -n "${GO_IM_SDK_GOARCH:-}" ]; then
+        export GOARCH="$GO_IM_SDK_GOARCH"
+    elif [ -z "${GOARCH:-}" ]; then
+        log "FAIL macOS native 测试必须显式设置 GOARCH=arm64 或 GOARCH=amd64"
+        exit 2
+    fi
+    log_diag "macOS native 架构: ${GOARCH}"
+fi
+if [ -n "$BUILD_TAGS" ]; then
+    (cd "$ROOT" && CGO_ENABLED="${CGO_ENABLED:-1}" go build -tags "$BUILD_TAGS" -o "$BIN" ./cmd/integration-demo)
+else
+    (cd "$ROOT" && CGO_ENABLED="${CGO_ENABLED:-1}" go build -o "$BIN" ./cmd/integration-demo)
+fi
 log_diag "二进制: $BIN"
 
 # wait_for <logfile> <pattern> <timeout_seconds> <描述>
@@ -168,6 +207,44 @@ wait_for_received_count() {
     return 1
 }
 
+# Escape one string for matching inside a JSON string. message_json is emitted
+# as a JSON-encoded string by slog, so the inner Message JSON quotes appear as
+# \" in the receiver log. Values are not printed by this assertion.
+escape_json_string() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# assert_received_ext <logfile> <baseline> <key> <value> <描述>
+# Only inspect message.received records after the baseline so an older message
+# carrying the same extension cannot make this acceptance check pass.
+assert_received_ext() {
+    local logfile="$1" baseline="$2" key="$3" value="$4" what="$5"
+    local key_json value_json ext_marker inner_fragment expected_fragment new_messages line ext_type
+    key_json=$(escape_json_string "$key")
+    value_json=$(escape_json_string "$value")
+    ext_marker=$(escape_json_string '"ext":{')
+    new_messages=$(grep "message.received" "$logfile" 2>/dev/null | tail -n "+$((baseline + 1))") || true
+    while IFS= read -r line; do
+        # integration-demo emits CLI Ext values as either string or
+        # json_string. Match both while keeping the expected key/value bound
+        # to one complete KeyValue object.
+        for ext_type in string json_string; do
+            inner_fragment="\"${key_json}\":{\"type\":\"${ext_type}\",\"value\":\"${value_json}\"}"
+            expected_fragment=$(escape_json_string "$inner_fragment")
+            case "$line" in
+                *"$ext_marker"*"$expected_fragment"*)
+                    log "OK   ${what}"
+                    return 0
+                    ;;
+            esac
+        done
+    done <<EOF
+$new_messages
+EOF
+    log "FAIL ${what}：新消息的 message_json 中未找到期望的 Ext key=$key"
+    return 1
+}
+
 # 提取 message.received 行的关键字段，方便排查（不打印完整的 message_json）
 summarize_received() {
     local log="$1" label="$2"
@@ -240,7 +317,7 @@ log "接收基线：${TARGET_LABEL}=$BASE_TARGET 条，${OTHER_LABEL}=$BASE_OTHE
 
 # 4) lxm 发送定向消息给目标成员
 log "==> [3/4] lxm 向 $GROUP_ID 发送定向给 $DIRECTED_USER 的消息"
-"$BIN" -c "$LXM_CONFIG" -debug -send-to "$GROUP_ID" -group -directed-users "$DIRECTED_USER" -send-text "$DIRECTED_TEXT" >"$LXM_SEND_LOG" 2>&1 &
+"$BIN" -c "$LXM_CONFIG" -debug -send-to "$GROUP_ID" -group -directed-users "$DIRECTED_USER" -send-ext "$DIRECTED_EXT" -send-text "$DIRECTED_TEXT" >"$LXM_SEND_LOG" 2>&1 &
 LXM_PID=$!
 log_diag "lxm 发送进程 pid=${LXM_PID}，日志 ${LXM_SEND_LOG}"
 wait_for "$LXM_SEND_LOG" "message.send_succeeded" 60 "定向消息已发送"
@@ -259,11 +336,15 @@ log ""
 log "==> [4/4] 校验结果"
 log "${TARGET_LABEL} 收到消息数: baseline=$BASE_TARGET -> now=$NOW_TARGET （期望 +1）"
 log "${OTHER_LABEL} 收到消息数: baseline=$BASE_OTHER -> now=$NOW_OTHER （期望 0 增长）"
+EXT_OK=0
+if assert_received_ext "$TARGET_LOG" "$BASE_TARGET" "$DIRECTED_EXT_KEY" "$DIRECTED_EXT_VALUE" "${TARGET_LABEL} 收到的定向消息包含消息级 Ext"; then
+    EXT_OK=1
+fi
 summarize_received "$LXM2_LOG" "lxm2"
 summarize_received "$XU_LOG" "xu"
 log ""
-if [ "$NOW_TARGET" -gt "$BASE_TARGET" ] && [ "$NOW_OTHER" -le "$BASE_OTHER" ]; then
-	log "PASS：${TARGET_LABEL} 收到定向消息，${OTHER_LABEL} 未收到"
+if [ "$NOW_TARGET" -gt "$BASE_TARGET" ] && [ "$NOW_OTHER" -eq "$BASE_OTHER" ] && [ "$EXT_OK" -eq 1 ]; then
+	log "PASS：${TARGET_LABEL} 收到带消息级 Ext 的定向消息，${OTHER_LABEL} 未收到"
 else
     log "FAIL：定向消息校验未通过"
     log "----- lxm 发送日志 -----"

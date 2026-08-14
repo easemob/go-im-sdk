@@ -1,6 +1,6 @@
 # Go IM SDK 集成 Demo 与 API 验收说明
 
-本文用于在真实环境中验证 `cmd/integration-demo`：长连接登录、实时消息收发、群组定向消息、用户属性以及公开群 REST API。
+本文用于在真实环境中验证 `cmd/integration-demo`：DNS 引导登录、长连接、实时消息收发、消息级 Ext、群组定向消息、用户属性以及公开群 REST API。
 
 业务工程通过 Go Module 导包的完整代码请看 [GO_SDK_INTEGRATION_GUIDE.md](GO_SDK_INTEGRATION_GUIDE.md)。本篇只保留联调命令和验收标准。
 
@@ -11,6 +11,9 @@
 ```bash
 go version
 go test ./cmd/integration-demo
+go test ./...
+go test -race ./...
+go vet ./...
 ```
 
 复制配置模板：
@@ -23,38 +26,50 @@ chmod 600 prod.yaml
 编辑 `prod.yaml`：
 
 ```yaml
-msync_host: "wss://.../websocket"
-rest_base: "https://.../org/app"
 app_key: "org#app"
 user_id: "your-user"
-resource: "go-service-instance-01"
+resource: "service-instance-01"
 token_file: "/run/secrets/easemob-token"
 ```
 
 配置要求：
 
-- `msync_host` 必须是 `wss://` 地址，`rest_base` 必须是 `https://` 地址。
 - `app_key` 使用 `org#app` 格式。
 - `user_id` 是环信 IM 用户 ID，不是昵称。
-- `resource` 必须由业务持久化。同一服务实例重启时保持不变；同一 IM 用户的并行实例必须使用不同 resource。
+- `resource` 保存业务的原始稳定值。同一服务实例重启时保持不变；同一 IM 用户的并行实例必须使用不同 resource。SDK 实际使用 `go-server-imsdk-<resource>`，前缀计入最终 128 字符限制，最终值不能包含空白、`/` 或 `@`。
 - token 推荐放在权限为 `0600` 的文件中，也可以使用 `GO_IM_SDK_TOKEN_FILE` 或 `GO_IM_SDK_TOKEN`。
+
+不再配置 `msync_host`、`rest_base` 或 `sdk_version`。Demo 先用 `AppKey` 和原始 resource 初始化 Client，在 `Config` 中一次性绑定 `MessageHandler` 和所有 listener，再调用 `Login(ctx, userID, token)`。首批同步消息因此不会早于 handler 注册；SDK 不补发历史回调，listener 也不应长时间阻塞。Login 固定请求：
+
+```text
+https://rs.easemob.com/easemob/server.json
+  ?sdk_version=<SDK 内部版本>
+  &app_key=<AppKey>
+  &file_version=1
+```
+
+DNS 返回的 `msync-wx.hosts` 和 `rest.hosts` 是本次登录的唯一 WSS/REST 地址来源。SDK 优先选择 `priority=1`，否则使用第一个有效 host；WSS 接受 `wss` 和可转换为 `wss` 的 `https`，REST 只接受 `https` 并按 AppKey 组成 `/org/app` 根路径。SDK 最多尝试 3 次可重试的 DNS 错误；请求失败、非 2xx、响应过大、JSON 非法或缺少有效 WSS/REST host 都会使 Login 直接失败，不回退到配置或本地缓存。
 
 ### 构建一次，后续直接运行
 
-macOS 本地协议/API 联调推荐使用 Go protobuf 回归模式：
+Linux 客户发布构建使用随 Module 提供的 native codec，需要启用 CGO 和 C/C++ 工具链：
 
 ```bash
 mkdir -p ./bin
-go build -tags gopbcodec -o ./bin/integration-demo ./cmd/integration-demo
-```
-
-Linux 客户发布包默认使用随 Module 提供的 native codec，需要启用 CGO 和 C/C++ 工具链：
-
-```bash
 CGO_ENABLED=1 go build -o ./bin/integration-demo ./cmd/integration-demo
 ```
 
-`gopbcodec` 是仓库内部回归/差分测试模式，不属于客户正式发布构建。
+macOS 仅用于本地 native ABI/API 验证，使用仓库已有的开发静态库：
+
+```bash
+CGO_ENABLED=1 GOARCH=arm64 \
+  go build -tags nativecodecdev -o ./bin/integration-demo ./cmd/integration-demo
+
+CGO_ENABLED=1 GOARCH=arm64 \
+  go test -tags nativecodecdev ./...
+```
+
+正式客户构建不使用 Go generated protobuf。
 
 ## 二、启动长连接接收消息
 
@@ -67,35 +82,25 @@ CGO_ENABLED=1 go build -o ./bin/integration-demo ./cmd/integration-demo
 也可以在 macOS 开发环境直接运行：
 
 ```bash
-go run -tags gopbcodec ./cmd/integration-demo \
-  -c prod.yaml \
-  -debug \
-  2>&1 | tee integration-gopb.log
-```
-
-macOS Apple Silicon 的 native codec 仅用于内部开发验证：
-
-```bash
-BUILD_DIR="$PWD/native/build/darwin-arm64" \
-  ./scripts/build-native-codec.sh
-
-CGO_ENABLED=1 GOARCH=arm64 \
-  go run -tags nativecodecdev ./cmd/integration-demo \
+go run -tags nativecodecdev ./cmd/integration-demo \
   -c prod.yaml \
   -debug \
   2>&1 | tee integration-native.log
 ```
 
-如果 Go 默认是 `darwin/amd64`，不要链接 arm64 静态库；应切换到 `GOARCH=arm64`，或使用真正的 amd64 native archive。
+Apple Silicon 使用 `GOARCH=arm64`；Intel Mac 使用与本机匹配的 amd64 native archive。
 
 ### 预期日志
 
 连接成功：
 
 ```text
+dns.resolved wss=wss://... rest_base=https://.../org/app
 connection.state state=connected
 connection.ready
 ```
+
+`dns.resolved` 只在 `-debug` 下输出，可用来确认 WSS 和 REST 都来自 DNS。DNS 阶段失败时，`connection.failed` 的错误会标识 `dns bootstrap` 及具体原因。
 
 收到实时消息：
 
@@ -107,13 +112,26 @@ wss.meta
 message.received
 ```
 
-`message.received` 中的 `message_json` 包含完整 `Message`，包括消息 ID、发送方、接收方、文本、CMD 参数和 Custom 扩展。
+`message.received` 包含 `ext_count`。其 `message_json` 是脱敏视图：包含消息 ID、发送方、接收方、body 类型以及完整的消息级 `Ext`，不包含文本正文、CMD Params、CustomExts 或原始 payload。
+
+带 Ext 的消息示例：
+
+```json
+{
+  "ext": {
+    "trace_id": {
+      "type": "string",
+      "value": "demo-123"
+    }
+  }
+}
+```
 
 `meta_count=0` 通常表示使用 `next_key` 继续拉取后已到达队列尾部，不代表解析失败。
 
 ## 三、使用命令行测试消息 API
 
-以下命令均可把 `go run -tags gopbcodec ./cmd/integration-demo` 替换为 `./bin/integration-demo`。
+以下命令均可直接使用 `./bin/integration-demo`；也可以在 macOS 上用 `go run -tags nativecodecdev` 替换二进制。
 
 ### 单聊文本消息
 
@@ -155,6 +173,30 @@ message.received
 ```
 
 `-send-params` 的值若是合法 JSON 对象或数组，会作为 `json_string` 发送；否则作为普通 `string` 发送。命令行用逗号分隔参数，所以包含逗号的 JSON 值应改用 Go API，示例见 [GO_SDK_INTEGRATION_GUIDE.md](GO_SDK_INTEGRATION_GUIDE.md#六发送消息)。
+
+### 单聊文本与消息级 Ext
+
+`-send-ext` 使用与 `-send-params` 相同的 `key=value` 解析规则，但它写入整条消息的 `SendRequest.Ext`：
+
+```bash
+./bin/integration-demo \
+  -c prod.yaml \
+  -debug \
+  -send-to peer-user \
+  -send-text "text with ext" \
+  -send-ext "trace_id=demo-123,payload={\"source\":\"integration-demo\"}" \
+  2>&1 | tee send-ext.log
+```
+
+命令行中合法 JSON 对象/数组映射为 `json_string`，其他值映射为 `string`。包含逗号的复杂 JSON 仍应改用 Go API。发送成功日志应有 `ext_count=2`，接收端的 `message.received` 应有 `ext_count=2`，且脱敏 `message_json` 中能看到 `trace_id` 和 `payload`。
+
+三类扩展字段的边界：
+
+- `SendRequest.Ext` 是消息级扩展，接收端对应 `Message.Ext`。Go API 支持 `KeyValueBool`、`KeyValueInt`、`KeyValueUint`、`KeyValueLong`、`KeyValueFloat`、`KeyValueDouble`、`KeyValueString` 和 `KeyValueJSONString`，SDK 按 key 稳定排序编码。
+- `MessageBody.Params` 只是 CMD body 参数，发送时支持 `KeyValueString` 和 `KeyValueJSONString`。
+- `MessageBody.CustomExts` 只是 Custom body 扩展，发送时支持 `KeyValueString` 和 `KeyValueJSONString`。
+
+`nil` 或空 `SendRequest.Ext` 不会发送 ext，与旧的 wire 行为保持一致。
 
 ### 普通群聊消息
 
@@ -227,6 +269,22 @@ body_0_type=command
 body_0_action=refresh-cache
 ```
 
+### 带消息级 Ext 的群组定向消息
+
+```bash
+./bin/integration-demo \
+  -c prod.yaml \
+  -debug \
+  -send-to GROUP_ID \
+  -group \
+  -directed-users "xu" \
+  -send-ext "trace_id=directed-demo,payload={\"source\":\"go-demo\"}" \
+  -send-text "directed with ext" \
+  2>&1 | tee send-directed-ext.log
+```
+
+发送端应出现 `message.send_succeeded` 且 `ext_count=2`。目标端 `xu` 应新增一条 `message.received`，`ext_count=2`，并在 `message_json.ext` 中看到 `trace_id=directed-demo` 与 JSON 类型的 `payload`；非目标成员不应收到该消息。
+
 ### 发送端如何判定
 
 发送端成功日志：
@@ -236,7 +294,7 @@ wss.ack status=0
 message.send_succeeded
 ```
 
-其中包含 `client_message_id`、`server_message_id` 和 `server_timestamp`。
+其中包含最终服务器消息 ID `message_id`、仅用于 ACK 关联/重试的 `client_message_id`、`server_timestamp` 和 `ext_count`。接收端同一条消息的 `meta_id` 应等于发送成功日志中的 `message_id`，而不是 `client_message_id`。
 
 注意：ACK 成功只说明服务端已受理消息，不证明目标客户端已经收到或完成业务处理。端到端投递必须同时检查目标端出现新的 `message.received`。
 
@@ -253,7 +311,7 @@ message.send_succeeded
 
 iOS 日志中显示的 `receiverList` 是 `Meta::toString()` 对 protobuf `directed_users` 字段的展示名称，线上协议字段仍是 `directed_users`。
 
-可以使用 REST 直接检查群成员。`REST_BASE` 与配置中的 `rest_base` 一致，并且已经包含 `/org/app`：
+可以使用 REST 直接检查群成员。`REST_BASE` 必须使用本次 `dns.resolved` 日志中的 `rest_base`，而不是本地配置值；SDK 已按 `AppKey` 自动补上 `/org/app`：
 
 ```bash
 export REST_BASE='https://a1.example.com/org/app'
@@ -302,24 +360,34 @@ curl -sS \
   -send-to GROUP_ID \
   -group \
   -directed-users "xu" \
-  -send-text "directed to xu" \
-  2>&1 | tee send-directed-xu.log
+  -send-ext "trace_id=directed-demo,payload={\"source\":\"go-demo\"}" \
+  -send-text "directed with ext" \
+  2>&1 | tee send-directed-ext.log
 ```
 
 验收结果：
 
-- 发送端：新增一条 `message.send_succeeded`。
-- `xu`：新增一条 `message.received`，且 `to` 等于本次 `GROUP_ID`。
+- 三端的 `-debug` 日志都先出现 `dns.resolved`，WSS 和 REST 都是 DNS 返回值。
+- 发送端：新增一条 `message.send_succeeded`，服务端 ACK 成功且 `ext_count=2`。
+- `xu`：新增一条 `message.received`，`to` 等于本次 `GROUP_ID`，`ext_count=2`，并且 `message_json.ext` 包含 `trace_id` 和 `payload`。
 - `lxm2`：`message.received` 数量不增加。
+
+为避免误判，发送前记录 `xu` 和 `lxm2` 的 `message.received` 基线数；收到 ACK 后同时检查目标端 `+1` 和非目标端 `+0`。
 
 不要用 `wss.unread_ignored` 判断实时消息是否收到；该日志是 `UNREAD` 保活/离线边界信息。
 
 ### 自动脚本测试
 
-仓库脚本会构建 Demo、启动 `lxm2`/`xu`、等待连接、由 `lxm` 创建包含二人的新公开群、等待群队列订阅、发送定向文本消息，然后检查目标端 `+1`、非目标端 `+0`：
+仓库脚本会构建 Demo、启动 `lxm2`/`xu`、等待连接、由 `lxm` 创建包含二人的新公开群、等待群队列订阅、发送带消息级 Ext 的定向文本消息，然后检查目标端 `+1`、目标端 Ext、非目标端 `+0`：
 
 ```bash
 ./scripts/test-directed-message.sh
+```
+
+macOS Apple Silicon 使用：
+
+```bash
+GOARCH=arm64 ./scripts/test-directed-message.sh
 ```
 
 默认定向给 `lxm2`。改为定向给 `xu`：
@@ -327,16 +395,31 @@ curl -sS \
 ```bash
 DIRECTED_USER=xu \
 DIRECTED_TEXT='directed to xu' \
-./scripts/test-directed-message.sh
+GOARCH=arm64 ./scripts/test-directed-message.sh
 ```
 
-脚本当前验证的是群组定向文本消息。Custom/CMD 使用上一节命令，在脚本创建并打印的 `GROUP_ID` 上手工验证即可。
+macOS 运行脚本时必须显式指定与 native archive 一致的 `GOARCH`；Linux 不需要设置该变量。
+
+脚本默认使用 `DIRECTED_EXT=trace_id=directed-demo`，可通过同名环境变量覆盖。它验证群组定向 Text、消息级 Ext 与目标/非目标范围；Custom/CMD 使用上一节命令，在脚本创建并打印的 `GROUP_ID` 上手工验证即可。
 
 脚本每次创建一个新的公开群，以消除错误群 ID、成员不一致和群队列订阅时序造成的假失败；测试结束不会自动解散该群，需要按测试环境的数据清理策略处理。
 
+### 真实环境完整回归清单
+
+不能只以一次定向 Text 代替全部回归。使用本文第三节的命令逐项完成：
+
+1. 单聊 Text、CMD、Custom；
+2. 普通群聊 Text；
+3. 群组定向 Text、CMD、Custom；
+4. 带消息级 Ext 的群组定向消息；
+5. 每次发送都检查发送端 ACK 和目标端的新 `message.received`；定向消息还要检查非目标成员 `+0`；
+6. Ext 用例同时检查发送/接收日志的 `ext_count` 和目标端 `message_json.ext`。
+
+每个进程的登录日志都应证明 DNS 拉取成功。无效 DNS 响应、缺少 WSS host 和缺少 REST host 应由离线单元测试验证登录失败，不要修改生产 DNS 或用真实账号制造这些异常。
+
 ## 五、使用命令行测试 REST API
 
-Demo 的 REST 操作与 WSS 使用同一份配置和 token。非 2xx 响应会打印 HTTP status、服务端错误码和 request ID，但不会打印 Authorization。
+Demo 的 REST 操作与 WSS 使用同一次 Login 的 DNS 结果、用户和 token。非 2xx 响应会打印 HTTP status、服务端错误码和 request ID，但不会打印 Authorization。
 
 ### 安全探测当前用户
 
@@ -432,6 +515,7 @@ Demo 的 REST 操作与 WSS 使用同一份配置和 token。非 2xx 响应会�
 常用日志：
 
 ```text
+dns.resolved
 wss.outbound / wss.inbound
 wss.notice / wss.queue_pull / wss.sync_batch
 wss.meta / message.received
@@ -447,7 +531,7 @@ rest.request / rest.response / rest.error
 4. 目标端是否新增 `message.received`。
 5. 非目标成员的 `message.received` 是否没有增加。
 
-日志不会输出 Authorization 或 token。Demo 为联调方便，会在消息回调中输出完整 `message_json`；生产业务应按隐私和安全要求缩减或脱敏。
+日志不会输出 Authorization 或 token。Demo 的 `message_json` 已脱敏，不输出文本正文、CMD Params、CustomExts 或原始 payload，但会保留本轮验收需要的消息级 Ext。Ext 也应视为业务数据，测试时不要放入 token、Authorization、个人信息或其他敏感值。
 
 ## 七、离线消息边界
 

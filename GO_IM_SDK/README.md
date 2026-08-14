@@ -1,12 +1,13 @@
 # Go IM SDK
 
-面向客户服务端的环信 IM 长连接 Go SDK。一个 `Client` 绑定一个 `UserID`，通过安全 WebSocket
-保持在线，提供可靠消息收发、公开群 REST 操作和显式用户属性 REST 操作。
+面向客户服务端的环信 IM 长连接 Go SDK。一个 `Client` 同一时刻登录一个 `UserID`，通过安全
+WebSocket 保持在线，提供可靠消息收发、公开群 REST 操作和显式用户属性 REST 操作。
 
 > 当前模块路径为 `github.com/easemob/go-im-sdk`。正式发布前请以 release 公告为准。
 
 ## 能力与边界
 
+- 登录前必须从 SDK 内置 DNS 引导地址获取 WSS 和 REST 地址；DNS 结果是本次登录的唯一地址来源，失败时不使用配置或缓存降级。
 - 仅支持 `wss://` msync 和 `https://` REST，不支持明文 ws/TCP，也不提供跳过 TLS 校验的选项。
 - 支持文本、命令、自定义消息，以及单聊、群聊和群定向消息。
 - `Send` 等待服务端 ACK；结果不确定时，业务重试必须复用原 `ClientMessageID`。
@@ -16,17 +17,18 @@
 
 最低 Go 版本为 1.21。目前主要面向 Linux 服务端。
 
-当前 SDK 已把 C++ protobuf 编解码实现、protobuf-lite runtime、C ABI 头文件和目标平台静态库直接放入
+当前 SDK 将预编译的 C++ native codec（包含 protobuf-lite runtime）、C ABI 头文件和目标平台静态库直接放入
 同一个 Go Module。用户无需安装 protoc、protobuf，也无需从 OSS 另行下载制品。Linux 构建默认使用
-native codec，需要 `CGO_ENABLED=1` 以及可用的 C/C++ 编译链接工具链；首期目标为
+native codec，需要 `CGO_ENABLED=1` 以及可用的 C/C++ 链接工具链；首期目标为
 `linux/amd64/glibc` 和 `linux/arm64/glibc`。当前客户部署基线为 glibc 2.28、GCC 8.5.0；客户环境同时提供 Clang 18.1.8，可作为兼容编译器，但最终发布制品必须以不高于 glibc 2.28 的构建环境生成，并检查 `GLIBC_*`/`GLIBCXX_*` 符号版本。
-仓库内 Go protobuf adapter 仅用于内部回归/差分测试，可通过 `gopbcodec` build tag 显式启用，不属于客户发布包。
-macOS 的 native archive 仅供内部开发验证，使用 `nativecodecdev` build tag，不属于首期发布支持矩阵。
+Go Module 通过 cgo 链接目标平台的静态 `.a` 和公开 C ABI header，不要求业务额外集成 framework 或部署 `.so`。
+客户构建只使用 native codec；Go generated protobuf、协议源码和内部 C++ 实现不属于客户发布包。
+macOS 的 native archive 仅供内部开发验证，使用 `nativecodecdev` build tag；正式发布目标为 Linux amd64/arm64 glibc。
 
 ## 安装与作为库使用
 
 ```bash
-go get github.com/easemob/go-im-sdk
+go get github.com/easemob/go-im-sdk/sdk@latest
 ```
 
 ```go
@@ -41,29 +43,40 @@ import (
 
 func main() {
     client, err := imsdk.New(imsdk.Config{
-        MsyncHost: "wss://msync.example.com:443/websocket",
-        RestBase:  "https://rest.example.com:443/org/app",
-        AppKey:    "org#app",
-        UserID:    "server-bot",
-        Token:     loadTokenFromSecretManager(),
-        Resource:  loadStableResource(), // 用户持久化；同一实例重启复用
+        AppKey:   "org#app",
+        Resource: loadStableResource(), // 保存原始值；SDK 会自动加前缀
         MessageHandler: func(ctx context.Context, msg *imsdk.Message) error {
             // 先可靠持久化/投递；返回 nil 后 SDK 才推进队列。
             return persistIdempotently(ctx, msg.MetaID, msg)
         },
+        OnConnectionStateChanged: func(state imsdk.ConnState) {
+            log.Printf("IM connection state: %s", state)
+        },
+        OnDisconnect: func(err error) { log.Printf("IM disconnected: %v", err) },
+        OnTokenExpired: func() { log.Print("IM token expired") },
+        OnUserForbidden: func() { log.Print("IM user forbidden") },
     })
     if err != nil { log.Fatal(err) }
-    if err := client.Connect(context.Background()); err != nil { log.Fatal(err) }
     defer client.Close(context.Background())
+    if err := client.Login(
+        context.Background(),
+        "server-bot",
+        loadTokenFromSecretManager(),
+    ); err != nil { log.Fatal(err) }
 }
 ```
 
-`Resource` 是必填的稳定设备身份。业务方必须持久化它：同一逻辑服务实例重启后继续使用原值；同一 IM 用户若有多个并行在线实例，每个实例必须使用不同值。SDK 不自动生成、不持久化，也无法跨机器检查重复。允许 1–128 个字符，不得包含空白、`/` 或 `@`。
+`New` 只创建 SDK 实例，`Login(ctx, userID, token)` 才开始 DNS、WSS 和 Provision 登录。
+`Login` 只能在未登录状态调用；`Logout` 后可以使用同一 Client 再次登录。`Send` 要求已登录且连接正常，发送方始终是当前登录用户。SDK 版本由库内部维护，业务不配置 `MsyncHost`、`RestBase` 或 `SDKVersion`。
+
+SDK 固定请求 `https://rs.easemob.com/easemob/server.json`，并携带 `sdk_version`、`app_key` 和 `file_version=1`。返回的 `msync-wx.hosts` 和 `rest.hosts` 分别决定 WSS 与 REST 地址；优先选择 `priority=1`，否则使用第一个有效 host。WSS 接受 `wss` 或可转换为 `wss` 的 `https`，REST 只接受 `https`。缺少任一有效地址、HTTP 失败、响应过大或 JSON 无效都会直接使登录失败。
+
+`Resource` 是必填的原始稳定设备身份。业务方必须持久化它：同一逻辑服务实例重启后继续使用原值；同一 IM 用户若有多个并行在线实例，每个实例必须使用不同值。SDK 不自动生成、不持久化，也无法跨机器检查重复。SDK 实际使用 `go-server-imsdk-<resource>`；前缀计入最终 128 字符限制，最终值不得包含空白、`/` 或 `@`。
 
 默认值：心跳间隔 120 秒、心跳超时 240 秒、连接/发送超时 15 秒、登出超时 5 秒、
 最大帧 4 MiB、写队列 256、handler 超时 30 秒、重试 3 次、跨队列并发 4。
 
-生产程序应处理 `OnTokenExpired`、`OnUserForbidden`、`OnUserRemoved`、其他设备登录和被踢事件。
+所有要使用的 listener 都必须在 `New` 的 `Config` 中传入，登录后不动态补注册，也不补发历史事件。这确保首批同步消息能被初始化时的 `MessageHandler` 接收。生产程序应处理 `OnDisconnect`、`OnTokenRotated`、`OnTokenWillExpire`、`OnTokenExpired`、`OnUserForbidden`、`OnUserRemoved`、`OnUserKickedByOtherDevice`、`OnUserLoginAnotherDevice` 和 `OnServerNotice`。listener 必须快速返回，不要在回调中执行长时间阻塞任务。
 这些业务性断开不会自动重连。PROVISION 返回轮换 token 时，使用 `OnTokenRotated` 将新 token 写入
 业务 secret 存储；SDK 自身不会持久化凭据。
 
@@ -73,13 +86,15 @@ PROVISION 的 `auth_token.expires_in` 会被记录为绝对过期时间（兼容
 
 ## 集成验收 Demo
 
-`cmd/integration-demo` 用于客户环境联调，覆盖 WSS 登录、连接状态、session ID、可选测试消息发送与 ACK、收到消息回调日志、token 生命周期和可选 REST 用户信息探测。日志只记录消息元数据和正文长度，不输出 token、Authorization 或完整正文。
+`cmd/integration-demo` 用于客户环境联调，覆盖 DNS 引导登录、连接状态、session ID、可选测试消息发送与 ACK、消息级 Ext、收到消息回调日志、token 生命周期和可选 REST 用户信息探测。`message_json` 是脱敏视图：保留消息元数据、body 类型和 Ext，不包含文本正文、CMD Params、CustomExts 或原始 payload。日志不输出 token 或 Authorization。
 
 完整的中文命令行测试步骤见 [INTEGRATION_DEMO_README.md](INTEGRATION_DEMO_README.md)。
 
 ```bash
 go run ./cmd/integration-demo -c prod.yaml
 go run ./cmd/integration-demo -c prod.yaml -send-to peer -send-text 'integration test'
+go run ./cmd/integration-demo -c prod.yaml -send-to peer \
+  -send-text 'with ext' -send-ext 'trace_id=demo-123,payload={"source":"demo"}'
 go run ./cmd/integration-demo -c prod.yaml -probe-rest
 ```
 
@@ -97,7 +112,7 @@ cp config.example.yaml prod.yaml
 chmod 600 prod.yaml
 ```
 
-编辑地址、app key 和 user ID。token 按以下顺序解析，较高优先级覆盖较低优先级：
+编辑 app key、user ID 和需要由业务持久化的原始 resource；WSS、REST 和 SDK 版本不进入配置。token 按以下顺序解析，较高优先级覆盖较低优先级：
 
 1. `GO_IM_SDK_TOKEN` 环境变量；
 2. `GO_IM_SDK_TOKEN_FILE` 指向的文件；
@@ -138,12 +153,23 @@ export GO_IM_SDK_TOKEN_FILE=/run/secrets/easemob-token
 result, err := client.Send(ctx, imsdk.SendRequest{
     ClientMessageID: businessStableID, // 可省略；重试时必须复用
     To: "user-b",
+    Ext: map[string]imsdk.KeyValue{
+        "trace_id": {Type: imsdk.KeyValueString, Value: "request-123"},
+        "payload": {
+            Type:  imsdk.KeyValueJSONString,
+            Value: `{"order_id":"123"}`,
+        },
+    },
     Body: imsdk.MessageBody{Type: imsdk.MessageBodyText, Text: "hello"},
 })
 ```
 
+发送成功后，`result.MessageID` 是 ACK 返回的最终服务器消息 ID；`result.ClientMessageID` 只是本地关联和结果不确定重试使用的 ID。接收端同一条消息的 `Message.MetaID` 与 `result.MessageID` 一致。兼容字段 `result.ServerMessageID` 与 `MessageID` 值相同，新代码应使用 `MessageID`。
+
+发送端的 `SendRequest.Ext` 对应接收端的 `Message.Ext`，支持 `KeyValueBool`、`KeyValueInt`、`KeyValueUint`、`KeyValueLong`、`KeyValueFloat`、`KeyValueDouble`、`KeyValueString` 和 `KeyValueJSONString`。SDK 按 key 稳定排序编码；`nil` 或空 map 不会在 wire 上携带 Ext。`Body.Params` 仅属于 CMD body，`Body.CustomExts` 仅属于 Custom body，二者都不是消息级 Ext，发送时仍只支持 `KeyValueString` 和 `KeyValueJSONString`。
+
 群聊设置 `IsGroup: true`；群定向消息同时填写 `DirectedUsers`。创建公开群、加入公开群、退出群，以及
-`UpdateOwnUserInfo`、`FetchUserInfo` 都使用初始化时提供的 REST 地址和 token。非 2xx 响应会返回
+`UpdateOwnUserInfo`、`FetchUserInfo` 都使用本次 Login 的 DNS 结果、当前用户和 token。非 2xx 响应会返回
 `*sdk.APIError`，其中保留受限大小的 `Response`、服务错误码、request ID 和 `RetryAfter`。对创建/加入等
 结果不确定的写操作，SDK 不自动重试。
 
@@ -182,6 +208,9 @@ go test ./...
 go test -race ./...
 go vet ./...
 go build ./cmd/server
+
+# macOS Apple Silicon 开发用 native codec 回归
+CGO_ENABLED=1 GOARCH=arm64 go test -tags nativecodecdev ./...
 ```
 
 测试应保持离线，不依赖真实环信后端。部署前至少验证 TLS 证书链、secret 权限、SIGTERM 优雅退出和

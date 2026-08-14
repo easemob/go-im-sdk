@@ -33,9 +33,8 @@ func (r *telemetryRecorder) snapshot() []TelemetryEvent {
 
 func restTestClient(server *httptest.Server, telemetry Telemetry) *Client {
 	return &Client{cfg: Config{
-		RestBase: server.URL + "/org/app", UserID: "owner/name", Resource: "server resource",
-		HTTPClient: server.Client(), Telemetry: telemetry,
-	}, token: "secret-token"}
+		Resource: "go-server-imsdk-server-resource", HTTPClient: server.Client(), Telemetry: telemetry,
+	}, userID: "owner/name", token: "secret-token", restBase: server.URL + "/org/app", state: LoginStateLoggedIn}
 }
 
 func TestUpdateOwnUserInfo(t *testing.T) {
@@ -108,7 +107,7 @@ func TestCreatePublicGroupFixedPolicyAndDefaults(t *testing.T) {
 		if r.Method != http.MethodPost || r.URL.Path != "/org/app/chatgroups" {
 			t.Errorf("request = %s %s", r.Method, r.URL.Path)
 		}
-		if r.URL.Query().Get("version") != "v3" || r.URL.Query().Get("resource") != "server resource" {
+		if r.URL.Query().Get("version") != "v3" || r.URL.Query().Get("resource") != "go-server-imsdk-server-resource" {
 			t.Errorf("query = %v", r.URL.Query())
 		}
 		var body map[string]any

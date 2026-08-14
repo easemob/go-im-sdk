@@ -1,7 +1,7 @@
 # Copy this file to a deployment-specific path and keep credentials out of it.
 # Environment priority: GO_IM_SDK_TOKEN, GO_IM_SDK_TOKEN_FILE, token_file, token.
-msync_host: "wss://msync.example.com:443/websocket"
-rest_base: "https://rest.example.com:443/org/app"
+# Login resolves authoritative WSS and REST endpoints from the SDK's fixed DNS
+# bootstrap service; do not add msync_host, rest_base or sdk_version here.
 app_key: "org#app"
 user_id: ""
 
@@ -12,10 +12,10 @@ token_file: ""
 token: ""
 
 domain: "easemob.com"
-# Required stable device identity. Persist and reuse it after restart. Two
-# concurrently online instances for the same user must use different values.
-resource: "go-service-instance-01"
-sdk_version: "4.0.0-go"
+# Required raw stable device identity. Persist and reuse it after restart. The
+# SDK sends go-server-imsdk-<resource>; the prefixed value must fit 128 chars
+# and contain no whitespace, '/' or '@'. Parallel instances need unique values.
+resource: "service-instance-01"
 heartbeat_interval_seconds: 120
 heartbeat_timeout_seconds: 240
 disable_reconnect: false

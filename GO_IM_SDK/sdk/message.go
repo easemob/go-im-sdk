@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -15,9 +16,11 @@ import (
 
 // Message is the stable, JSON-serializable representation delivered to users.
 type Message struct {
-	From      string              `json:"from"`
-	To        string              `json:"to"`
-	IsGroup   bool                `json:"is_group"`
+	From    string `json:"from"`
+	To      string `json:"to"`
+	IsGroup bool   `json:"is_group"`
+	// MetaID is the authoritative server-assigned message ID for a received
+	// message. For a message sent by this SDK, it equals SendResult.MessageID.
 	MetaID    uint64              `json:"meta_id"`
 	Timestamp uint64              `json:"timestamp"`
 	Bodies    []*MessageBody      `json:"bodies"`
@@ -151,11 +154,20 @@ type SendRequest struct {
 	To              string
 	IsGroup         bool
 	DirectedUsers   []string
+	Ext             map[string]KeyValue
 	Body            MessageBody
 }
 
 type SendResult struct {
+	// MessageID is the authoritative message ID assigned by the server after
+	// a successful ACK. It is the send-side equivalent of Message.MetaID on
+	// the receiving side.
+	MessageID uint64
+	// ClientMessageID is only the client-generated correlation/idempotency ID
+	// used to match the ACK and safely retry an outcome-unknown send.
 	ClientMessageID uint64
+	// ServerMessageID is kept as a compatibility alias for MessageID.
+	// Deprecated: use MessageID.
 	ServerMessageID uint64
 	ServerTimestamp uint64
 }
@@ -181,6 +193,10 @@ func buildOutgoingMeta(codec internalprotocol.Codec, appKey, userID, domain, res
 	if err != nil {
 		return internalprotocol.Meta{}, err
 	}
+	ext, err := encodeMessageExt(req.Ext)
+	if err != nil {
+		return internalprotocol.Meta{}, fmt.Errorf("message ext: %w", err)
+	}
 	messageType := internalprotocol.MessageChat
 	if req.IsGroup {
 		messageType = internalprotocol.MessageGroupChat
@@ -196,7 +212,7 @@ func buildOutgoingMeta(codec internalprotocol.Codec, appKey, userID, domain, res
 	// MessageBody.from/to 只携带 bare user ID。
 	body := internalprotocol.MessageBody{Kind: messageType,
 		From: internalprotocol.JID{Name: userID}, To: internalprotocol.JID{Name: req.To},
-		Contents: []internalprotocol.Content{content}}
+		Contents: []internalprotocol.Content{content}, Ext: ext}
 	payload, err := codec.EncodeMessageBody(body)
 	if err != nil {
 		return internalprotocol.Meta{}, fmt.Errorf("marshal message body: %w", err)
@@ -212,9 +228,79 @@ func buildOutgoingMeta(codec internalprotocol.Codec, appKey, userID, domain, res
 	return internalprotocol.Meta{ID: id, To: to, Namespace: internalprotocol.NamespaceChat, Payload: payload, Route: route, DirectedUsers: append([]string(nil), req.DirectedUsers...)}, nil
 }
 
-func buildSendMeta(c *Client, req SendRequest, id uint64) (internalprotocol.Meta, error) {
+func buildSendMeta(c *Client, userID string, req SendRequest, id uint64) (internalprotocol.Meta, error) {
 	req.ClientMessageID = id
-	return buildOutgoingMeta(c.codec, c.cfg.AppKey, c.cfg.UserID, c.cfg.Domain, c.cfg.Resource, req)
+	return buildOutgoingMeta(c.codec, c.cfg.AppKey, userID, c.cfg.Domain, c.cfg.Resource, req)
+}
+
+func encodeMessageExt(values map[string]KeyValue) ([]internalprotocol.KeyValue, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]internalprotocol.KeyValue, 0, len(values))
+	for _, key := range keys {
+		if key == "" {
+			return nil, fmt.Errorf("extension key is empty")
+		}
+		value := values[key]
+		encoded := internalprotocol.KeyValue{Key: key}
+		switch value.Type {
+		case KeyValueBool:
+			v, ok := value.Value.(bool)
+			if !ok {
+				return nil, fmt.Errorf("%q: bool KeyValue requires bool", key)
+			}
+			encoded.Kind, encoded.Bool = internalprotocol.KeyValueBool, v
+		case KeyValueInt:
+			v, ok := asInt64(value.Value)
+			if !ok {
+				return nil, fmt.Errorf("%q: int KeyValue requires an integer", key)
+			}
+			encoded.Kind, encoded.Int64 = internalprotocol.KeyValueInt, v
+		case KeyValueUint:
+			v, ok := asUint64(value.Value)
+			if !ok {
+				return nil, fmt.Errorf("%q: uint KeyValue requires a non-negative integer", key)
+			}
+			encoded.Kind, encoded.Uint64 = internalprotocol.KeyValueUint, v
+		case KeyValueLong:
+			v, ok := asInt64(value.Value)
+			if !ok {
+				return nil, fmt.Errorf("%q: llint KeyValue requires an integer", key)
+			}
+			encoded.Kind, encoded.Int64 = internalprotocol.KeyValueLong, v
+		case KeyValueFloat:
+			v, ok := asFloat64(value.Value)
+			if !ok {
+				return nil, fmt.Errorf("%q: float KeyValue requires float32 or float64", key)
+			}
+			encoded.Kind, encoded.Float = internalprotocol.KeyValueFloat, float32(v)
+		case KeyValueDouble:
+			v, ok := asFloat64(value.Value)
+			if !ok {
+				return nil, fmt.Errorf("%q: double KeyValue requires float32 or float64", key)
+			}
+			encoded.Kind, encoded.Double = internalprotocol.KeyValueDouble, v
+		case KeyValueString, KeyValueJSONString:
+			v, ok := value.Value.(string)
+			if !ok {
+				return nil, fmt.Errorf("%q: %s KeyValue requires string", key, value.Type)
+			}
+			encoded.Kind, encoded.String = internalprotocol.KeyValueString, v
+			if value.Type == KeyValueJSONString {
+				encoded.Kind = internalprotocol.KeyValueJSONString
+			}
+		default:
+			return nil, fmt.Errorf("%q: unsupported KeyValue type %q", key, value.Type)
+		}
+		result = append(result, encoded)
+	}
+	return result, nil
 }
 
 func encodeOutgoingContent(body MessageBody) (internalprotocol.Content, error) {
@@ -322,6 +408,12 @@ func decodeKeyValues(values []internalprotocol.KeyValue) map[string]KeyValue {
 
 func asInt64(v any) (int64, bool) {
 	switch n := v.(type) {
+	case int8:
+		return int64(n), true
+	case int16:
+		return int64(n), true
+	case int32:
+		return int64(n), true
 	case int64:
 		return n, true
 	case int:
@@ -333,10 +425,28 @@ func asInt64(v any) (int64, bool) {
 
 func asUint64(v any) (uint64, bool) {
 	switch n := v.(type) {
+	case uint8:
+		return uint64(n), true
+	case uint16:
+		return uint64(n), true
+	case uint32:
+		return uint64(n), true
 	case uint64:
 		return n, true
 	case uint:
 		return uint64(n), true
+	case int8:
+		if n >= 0 {
+			return uint64(n), true
+		}
+	case int16:
+		if n >= 0 {
+			return uint64(n), true
+		}
+	case int32:
+		if n >= 0 {
+			return uint64(n), true
+		}
 	case int64:
 		if n >= 0 {
 			return uint64(n), true
@@ -351,6 +461,17 @@ func asUint64(v any) (uint64, bool) {
 		}
 	}
 	return 0, false
+}
+
+func asFloat64(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float32:
+		return float64(n), true
+	case float64:
+		return n, true
+	default:
+		return 0, false
+	}
 }
 
 // Equal provides a precise comparison for tests and users handling decoded

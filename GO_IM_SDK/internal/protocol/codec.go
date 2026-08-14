@@ -1,7 +1,7 @@
 package protocol
 
-// Codec is the complete msync serialization boundary. Implementations may use
-// generated Go protobuf, a native C ABI, or a deterministic test fake.
+// Codec is the complete msync serialization boundary. The public SDK uses the
+// native C ABI; tests may provide a deterministic fake.
 // Implementations must be safe for concurrent use.
 type Codec interface {
 	EncodeProvision(ProvisionRequest) ([]byte, error)
