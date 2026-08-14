@@ -1,0 +1,6 @@
+/bin/
+/server
+*.pid
+*.log
+/prod.yaml
+/native/build/

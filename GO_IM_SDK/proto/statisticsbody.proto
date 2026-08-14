@@ -1,0 +1,48 @@
+package easemob.pb;
+
+option optimize_for = LITE_RUNTIME;
+
+message StatisticsBody
+{
+  enum Operation
+  {
+    INFORMATION		          = 0;  // sdk send information when login, such as os type, sdk version, login time, etc
+    USER_REMOVED                  = 1;  // user was removed from server side while user is online
+    USER_LOGIN_ANOTHER_DEVICE     = 2;  // user login on another device
+    USER_KICKED_BY_CHANGE_PASSWORD     = 3;  // user was kicked by change password
+    USER_KICKED_BY_OTHER_DEVICE   = 4;  // user was kicked by other device or console backend
+  };
+
+  enum OsType
+  {
+    OS_IOS      = 0;
+    OS_ANDROID  = 1;
+    OS_LINUX    = 2;
+    OS_OSX      = 3;
+    OS_WIN      = 4;
+    OS_CUSTOM   = 5;
+    OS_HARMONY  = 6;
+    OS_OTHER    = 16;
+  };
+
+  enum NetworkType
+  {
+    NETWORK_NONE    = 0;
+    NETWORK_WIFI    = 1;
+    NETWORK_4G      = 2;
+    NETWORK_3G      = 3;
+    NETWORK_2G      = 4;
+    NETWORK_WIRE    = 5;
+  };
+
+  optional Operation   operation     = 1;
+  optional OsType      os            = 2;
+  optional string      version       = 3;
+  optional NetworkType network       = 4;
+  optional uint32      im_time       = 5;
+  optional uint32      chat_time     = 6;
+  optional string      location      = 7; // used for report user location, format: "lonlat:xxx.xxx:xxx, cellid: xxx, wifissid: xxx, mnc: xxx, mcc: xxx"
+  optional string  replace_device_name = 8;//used for notify who kicked you,pass device name default
+  optional string session_id = 9; //connection unique id
+  optional string      reason        = 10;//notify other device reason
+}

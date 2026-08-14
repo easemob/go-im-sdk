@@ -1,0 +1,13 @@
+Third-party notices
+===================
+
+protobuf-lite
+-------------
+
+产品说明：用环信 Go IM SDK 的 protobuf 编解码库。
+
+native codec 静态库将把协议编解码实现及其 protobuf-lite 运行时
+静态链接到 SDK 制品中。用户无需安装 protoc、protobuf 或 libprotobuf。
+
+内部实现使用 Protocol Buffers 2.6.1 lite runtime。正式对外发布前，许可证全文、
+来源和源码获取方式必须由法务确认后随发布包补充，并同步记录在 SBOM 中。

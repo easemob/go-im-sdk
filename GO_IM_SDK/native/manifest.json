@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "sdk_module": "github.com/easemob/go-im-sdk",
+  "sdk_version": "v0.0.0-dev",
+  "codec_abi_version": 1,
+  "codec_name": "em-msync-codec",
+  "protobuf_notice": "用环信 Go IM SDK 的 protobuf 编解码库",
+  "build_baseline": {
+    "glibc": "2.28",
+    "gcc": "8.5.0",
+    "clang": "18.1.8",
+    "status": "protocol-regenerated; amd64-rebuilt-rocky8; arm64-pending-baseline-build"
+  },
+  "artifacts": [
+    {
+      "goos": "linux",
+      "goarch": "amd64",
+      "libc": "glibc",
+      "archive": "native/lib/linux-amd64-glibc/libem_msync_codec.a",
+      "sha256": "526deb84f22f6c05d710cca40c3db428430ee970315ef9907ba3e5dced88f593"
+    },
+    {
+      "goos": "linux",
+      "goarch": "arm64",
+      "libc": "glibc",
+      "archive": "native/lib/linux-arm64-glibc/libem_msync_codec.a",
+      "sha256": "fbe52bed12ce7bd7ddebedc80418a297e6433f38af75c0bda5aeb93134c9f1e0"
+    }
+  ]
+}
