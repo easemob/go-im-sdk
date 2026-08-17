@@ -19,7 +19,7 @@ import (
 // MessageHandler 处理一条入站消息。
 //
 // 契约：handler 必须遵守传入的 context 并及时返回。context 会在
-// HandlerTimeout 后取消，但取消是协作式的——SDK 无法强制终止一个忽略
+// handlerTimeout 后取消，但取消是协作式的——SDK 无法强制终止一个忽略
 // context 且永久阻塞的 handler。这样的 handler 会永久占用一个并发槽位，
 // 并使 Health().StuckHandlers 持续增长。业务方必须在 handler 内部检查
 // ctx、限制阻塞时长并自行管理外部资源。
@@ -57,32 +57,20 @@ type Config struct {
 	// another service or client kicks this connection and is reported through
 	// OnDisconnect, without a dedicated kick callback.
 	Resource                 string
-	HeartbeatInterval        time.Duration
-	HeartbeatTimeout         time.Duration
-	ConnectTimeout           time.Duration
-	SendTimeout              time.Duration
-	LogoutTimeout            time.Duration
 	DisableReconnect         bool
-	MaxRedirectHops          int
-	MaxFrameBytes            int64
-	WriteQueueSize           int
-	HandlerTimeout           time.Duration
-	HandlerMaxAttempts       int
-	HandlerConcurrency       int
-	TokenExpiryWarningBefore time.Duration
 	HTTPClient               *http.Client
 	Logger                   *slog.Logger
 	Telemetry                Telemetry
 	Debug                    bool
 	MessageHandler           MessageHandler
-	OnConnectionStateChanged func(ConnState)
-	OnDisconnect             func(error)
+	OnConnectionStateChanged func(userID string, state ConnState)
+	OnDisconnect             func(userID string, err error)
 	// OnTokenExpired reports that authentication failed because the current
 	// token is already expired. The connection is terminal at this point.
-	OnTokenExpired func()
+	OnTokenExpired func(userID string)
 	// OnTokenWillExpire reports the expiry time learned from Provision before
-	// it is reached, using TokenExpiryWarningBefore as the lead time.
-	OnTokenWillExpire func(time.Time)
+	// it is reached, using tokenExpiryWarningBefore as the lead time.
+	OnTokenWillExpire func(userID string, expiresAt time.Time)
 }
 
 type LoginState int
@@ -143,16 +131,16 @@ type HealthStatus struct {
 	QueueBacklog         int        `json:"queue_backlog"`
 	LastError            string     `json:"last_error,omitempty"`
 	TokenExpiresAt       time.Time  `json:"token_expires_at,omitempty"`
-	// StuckHandlers 是当前超过 HandlerTimeout 仍未返回的 handler 数量。
+	// StuckHandlers 是当前超过 handlerTimeout 仍未返回的 handler 数量。
 	// 持续大于 0 说明存在忽略 context 的 handler，应告警并定位修复。
 	StuckHandlers int `json:"stuck_handlers"`
 }
 
 type callbacks struct {
-	connection      func(ConnState)
-	disconnect      func(error)
-	tokenExpired    func()
-	tokenWillExpire func(time.Time)
+	connection      func(string, ConnState)
+	disconnect      func(string, error)
+	tokenExpired    func(string)
+	tokenWillExpire func(string, time.Time)
 }
 
 type Client struct {
@@ -205,20 +193,20 @@ func New(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("initialize protocol codec: %w", err)
 	}
 	c := &Client{cfg: cfg, logger: cfg.Logger, state: LoginStateLogout, connState: ConnStateDisconnected, idPrefix: binary.BigEndian.Uint64(seed[:]) & 0xffffffff00000000,
-		eventCtx: eventCtx, eventCancel: eventCancel, events: make(chan func(), cfg.WriteQueueSize),
-		batches: make(chan batchJob, cfg.WriteQueueSize),
+		eventCtx: eventCtx, eventCancel: eventCancel, events: make(chan func(), writeQueueSize),
+		batches: make(chan batchJob, writeQueueSize),
 		codec:   codec, debug: cfg.Debug,
 		callbacks: callbacks{
 			connection: cfg.OnConnectionStateChanged, disconnect: cfg.OnDisconnect,
 			tokenExpired: cfg.OnTokenExpired, tokenWillExpire: cfg.OnTokenWillExpire,
 		},
-		wsDialer: &websocket.Dialer{HandshakeTimeout: cfg.ConnectTimeout, Proxy: http.ProxyFromEnvironment, EnableCompression: false}}
+		wsDialer: &websocket.Dialer{HandshakeTimeout: connectTimeout, Proxy: http.ProxyFromEnvironment, EnableCompression: false}}
 	c.eventWG.Add(1)
 	go c.dispatchEvents()
 	// Client 级固定 handler worker 池：所有连接代际共享，重连不再创建新 worker。
 	// 这样即使 handler 忽略 context 永久阻塞，goroutine 数量也有固定上限，
 	// 不会随重连次数跨代际累积。
-	for i := 0; i < cfg.HandlerConcurrency; i++ {
+	for i := 0; i < handlerConcurrency; i++ {
 		go c.batchWorker()
 	}
 	return c, nil
@@ -228,57 +216,8 @@ func applyDefaultsAndValidate(c *Config) error {
 	if c.Domain == "" {
 		c.Domain = "easemob.com"
 	}
-	if c.HeartbeatInterval <= 0 {
-		c.HeartbeatInterval = 120 * time.Second
-	}
-	if c.HeartbeatTimeout <= 0 {
-		c.HeartbeatTimeout = 240 * time.Second
-	}
-	if c.ConnectTimeout <= 0 {
-		c.ConnectTimeout = 15 * time.Second
-	}
-	if c.SendTimeout <= 0 {
-		c.SendTimeout = 15 * time.Second
-	}
-	if c.LogoutTimeout <= 0 {
-		c.LogoutTimeout = 5 * time.Second
-	}
-	if c.MaxRedirectHops <= 0 {
-		c.MaxRedirectHops = 5
-	}
-	if c.MaxFrameBytes <= 0 {
-		c.MaxFrameBytes = 4 << 20
-	}
-	if c.WriteQueueSize <= 0 {
-		c.WriteQueueSize = 256
-	}
-	if c.HandlerTimeout <= 0 {
-		c.HandlerTimeout = 30 * time.Second
-	}
-	if c.HandlerMaxAttempts <= 0 {
-		c.HandlerMaxAttempts = 3
-	}
-	if c.HandlerConcurrency <= 0 {
-		c.HandlerConcurrency = 4
-	}
-	if c.TokenExpiryWarningBefore <= 0 {
-		c.TokenExpiryWarningBefore = 5 * time.Minute
-	}
 	if c.Logger == nil {
 		c.Logger = defaultLogger()
-	}
-	// 上限校验：防止误配极大值造成内存/goroutine 压力。
-	if c.HandlerConcurrency > 64 {
-		return fmt.Errorf("HandlerConcurrency must be between 1 and 64")
-	}
-	if c.WriteQueueSize > 1<<16 {
-		return fmt.Errorf("WriteQueueSize must be between 1 and %d", 1<<16)
-	}
-	if c.MaxFrameBytes > 16<<20 {
-		return fmt.Errorf("MaxFrameBytes must be between 1 and %d", 16<<20)
-	}
-	if c.HandlerTimeout < time.Second {
-		return fmt.Errorf("HandlerTimeout must be at least 1s")
 	}
 	if c.MessageHandler == nil {
 		return fmt.Errorf("MessageHandler is required")
@@ -301,6 +240,23 @@ const (
 	sdkVersion        = "4.0.0-go"
 	resourcePrefix    = "go-server-imsdk-"
 	maxResourceLength = 128
+)
+
+// 以下参数是 SDK 的固定值（不再暴露为 Config 配置项）。代码开源，如需调整请
+// fork 后自行修改这些常量。
+const (
+	heartbeatInterval        = 120 * time.Second
+	heartbeatTimeout         = 240 * time.Second
+	connectTimeout           = 15 * time.Second
+	sendTimeout              = 15 * time.Second
+	logoutTimeout            = 5 * time.Second
+	maxRedirectHops          = 5
+	maxFrameBytes            = 4 << 20
+	writeQueueSize           = 256
+	handlerTimeout           = 30 * time.Second
+	handlerMaxAttempts       = 3
+	handlerConcurrency       = 4
+	tokenExpiryWarningBefore = 5 * time.Minute
 )
 
 func (c *Client) LoginState() LoginState { c.mu.RLock(); defer c.mu.RUnlock(); return c.state }
@@ -365,9 +321,10 @@ func (c *Client) setStates(login LoginState, conn ConnState) {
 	c.state = login
 	c.connState = conn
 	cb := c.callbacks.connection
+	userID := c.userID
 	c.mu.Unlock()
 	if changed && cb != nil {
-		c.emit(func() { cb(conn) })
+		c.emit(func() { cb(userID, conn) })
 	}
 }
 func safeCall(fn func()) { defer func() { _ = recover() }(); fn() }

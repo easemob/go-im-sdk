@@ -57,6 +57,9 @@ type connectionRun struct {
 
 func (c *Client) isClosed() bool { c.mu.RLock(); defer c.mu.RUnlock(); return c.closed }
 
+// Login 使用 userID/token 建立长连接会话。userID 应尽量使用全小写（大小写混杂
+// 也可以），但务必保证该账号不会在移动端 SDK 上登录：移动端会把 userID 统一转为
+// 全小写，若服务端账号存在大写字符，同一账号在移动端与服务端会对应到不同的 userID。
 func (c *Client) Login(ctx context.Context, userID, token string) error {
 	if strings.TrimSpace(userID) == "" {
 		return newError(ErrNotLoggedIn, "login", "user ID is empty")
@@ -85,9 +88,9 @@ func (c *Client) Login(ctx context.Context, userID, token string) error {
 	cb := c.callbacks.connection
 	c.mu.Unlock()
 	if cb != nil {
-		c.emit(func() { cb(ConnStateConnecting) })
+		c.emit(func() { cb(userID, ConnStateConnecting) })
 	}
-	connectCtx, cancel := context.WithTimeout(ctx, c.cfg.ConnectTimeout)
+	connectCtx, cancel := context.WithTimeout(ctx, connectTimeout)
 	defer cancel()
 	stopLifecycleCancel := context.AfterFunc(c.eventCtx, cancel)
 	defer stopLifecycleCancel()
@@ -117,7 +120,7 @@ func (c *Client) Login(ctx context.Context, userID, token string) error {
 	c.lastStableConnect.Store(time.Now().UnixNano())
 	c.mu.Unlock()
 	if cb != nil {
-		c.emit(func() { cb(ConnStateConnected) })
+		c.emit(func() { cb(userID, ConnStateConnected) })
 	}
 	go c.monitor(r)
 	return nil
@@ -126,7 +129,7 @@ func (c *Client) Login(ctx context.Context, userID, token string) error {
 func (c *Client) connectWithRedirects(ctx context.Context, endpoint string) (*connectionRun, error) {
 	seen := map[string]struct{}{}
 	for hop := 0; ; hop++ {
-		if hop > c.cfg.MaxRedirectHops {
+		if hop > maxRedirectHops {
 			return nil, newError(ErrRedirectLimit, "provision", "maximum redirect hops exceeded")
 		}
 		if _, ok := seen[endpoint]; ok {
@@ -171,9 +174,9 @@ func (c *Client) dial(ctx context.Context, endpoint string) (*connectionRun, err
 		}
 		return nil, classifyNetworkError("websocket dial", err)
 	}
-	conn.SetReadLimit(c.cfg.MaxFrameBytes)
+	conn.SetReadLimit(maxFrameBytes)
 	rctx, cancel := context.WithCancel(context.Background())
-	r := &connectionRun{client: c, ctx: rctx, cancel: cancel, conn: conn, endpoint: endpoint, generation: c.generation.Add(1), writes: make(chan writeRequest, c.cfg.WriteQueueSize), provision: make(chan provisionResult, 1), logout: make(chan error, 1), done: make(chan struct{}), pending: map[uint64]chan ackResult{}, queues: map[string]*queueState{}}
+	r := &connectionRun{client: c, ctx: rctx, cancel: cancel, conn: conn, endpoint: endpoint, generation: c.generation.Add(1), writes: make(chan writeRequest, writeQueueSize), provision: make(chan provisionResult, 1), logout: make(chan error, 1), done: make(chan struct{}), pending: map[uint64]chan ackResult{}, queues: map[string]*queueState{}}
 	r.lastPong.Store(time.Now().UnixNano())
 	r.wg.Add(2)
 	go r.writePump()
@@ -242,7 +245,7 @@ func (r *connectionRun) sendFrame(ctx context.Context, frame []byte) error {
 
 func (r *connectionRun) writePump() {
 	defer r.wg.Done()
-	writeTimeout := r.client.cfg.SendTimeout
+	writeTimeout := sendTimeout
 	for {
 		select {
 		case req := <-r.writes:
@@ -261,7 +264,7 @@ func (r *connectionRun) writePump() {
 
 func (r *connectionRun) readPump() {
 	defer r.wg.Done()
-	readTimeout := r.client.cfg.HeartbeatTimeout
+	readTimeout := heartbeatTimeout
 	for {
 		_ = r.conn.SetReadDeadline(time.Now().Add(readTimeout))
 		typ, data, err := r.conn.ReadMessage()
@@ -442,6 +445,7 @@ func (c *Client) scheduleTokenExpiryWarning(expiresAt time.Time) {
 	if expiresAt.IsZero() || cb == nil {
 		return
 	}
+	userID := c.currentUserID()
 	ctx, cancel := context.WithCancel(c.eventCtx)
 	c.mu.Lock()
 	if c.tokenWarningCancel != nil {
@@ -449,13 +453,13 @@ func (c *Client) scheduleTokenExpiryWarning(expiresAt time.Time) {
 	}
 	c.tokenWarningCancel = cancel
 	c.mu.Unlock()
-	delay := time.Until(expiresAt.Add(-c.cfg.TokenExpiryWarningBefore))
+	delay := time.Until(expiresAt.Add(-tokenExpiryWarningBefore))
 	go func() {
 		timer := time.NewTimer(maxDuration(delay, 0))
 		defer timer.Stop()
 		select {
 		case <-timer.C:
-			c.emit(func() { cb(expiresAt) })
+			c.emit(func() { cb(userID, expiresAt) })
 		case <-ctx.Done():
 		}
 	}()
@@ -470,12 +474,12 @@ func maxDuration(a, b time.Duration) time.Duration {
 
 func (r *connectionRun) heartbeat() {
 	defer r.wg.Done()
-	tick := time.NewTicker(r.client.cfg.HeartbeatInterval)
+	tick := time.NewTicker(heartbeatInterval)
 	defer tick.Stop()
 	for {
 		select {
 		case <-tick.C:
-			if time.Since(time.Unix(0, r.lastPong.Load())) > r.client.cfg.HeartbeatTimeout {
+			if time.Since(time.Unix(0, r.lastPong.Load())) > heartbeatTimeout {
 				r.fail(newError(ErrTimeout, "heartbeat", "pong timeout"))
 				return
 			}
@@ -495,7 +499,7 @@ func (r *connectionRun) sendUnread() error {
 	}
 	// 心跳发送使用带 deadline 的 context，避免在写背压时永久阻塞；
 	// 否则看门狗会被它本该监管的写队列卡死，无法触发 pong 超时。
-	ctx, cancel := context.WithTimeout(r.ctx, r.client.cfg.SendTimeout)
+	ctx, cancel := context.WithTimeout(r.ctx, sendTimeout)
 	defer cancel()
 	return r.sendFrame(ctx, frame)
 }
@@ -541,11 +545,12 @@ func (c *Client) reconnect(old *connectionRun) {
 	c.state = LoginStateReconnecting
 	c.connState = ConnStateReconnecting
 	stateCallback := c.callbacks.connection
+	userID := c.userID
 	endpoint := c.msyncHost
 	lastErr := c.lastErr
 	c.mu.Unlock()
 	if changed && stateCallback != nil {
-		c.emit(func() { stateCallback(ConnStateReconnecting) })
+		c.emit(func() { stateCallback(userID, ConnStateReconnecting) })
 	}
 	var redirect *redirectError
 	if errors.As(lastErr, &redirect) {
@@ -589,7 +594,7 @@ func (c *Client) reconnect(old *connectionRun) {
 			return
 		}
 		c.connectMu.Lock()
-		ctx, cancel := context.WithTimeout(c.eventCtx, c.cfg.ConnectTimeout)
+		ctx, cancel := context.WithTimeout(c.eventCtx, connectTimeout)
 		r, err := c.connectWithRedirects(ctx, endpoint)
 		cancel()
 		c.connectMu.Unlock()
@@ -618,7 +623,7 @@ func (c *Client) reconnect(old *connectionRun) {
 		c.lastStableConnect.Store(time.Now().UnixNano())
 		c.mu.Unlock()
 		if cb := c.callbackSnapshot().connection; cb != nil {
-			c.emit(func() { cb(ConnStateConnected) })
+			c.emit(func() { cb(userID, ConnStateConnected) })
 		}
 		go c.monitor(r)
 		return
@@ -663,6 +668,7 @@ func (c *Client) recordTerminalForRun(expected *connectionRun, err error) {
 	c.connState = ConnStateDisconnected
 	c.run = nil
 	c.sessionID = ""
+	userID := c.userID
 	c.userID = ""
 	c.token = ""
 	c.msyncHost = ""
@@ -674,20 +680,20 @@ func (c *Client) recordTerminalForRun(expected *connectionRun, err error) {
 	}
 	cb := c.callbacks.disconnect
 	c.mu.Unlock()
-	c.fireErrorCallback(err)
+	c.fireErrorCallback(userID, err)
 	if cb != nil {
-		c.emit(func() { cb(err) })
+		c.emit(func() { cb(userID, err) })
 	}
 	if state := c.callbackSnapshot().connection; state != nil {
-		c.emit(func() { state(ConnStateDisconnected) })
+		c.emit(func() { state(userID, ConnStateDisconnected) })
 	}
 }
-func (c *Client) fireErrorCallback(err error) {
+func (c *Client) fireErrorCallback(userID string, err error) {
 	callbacks := c.callbackSnapshot()
 	switch errorCode(err) {
 	case ErrTokenExpired:
 		if callbacks.tokenExpired != nil {
-			c.emit(callbacks.tokenExpired)
+			c.emit(func() { callbacks.tokenExpired(userID) })
 		}
 	}
 }
@@ -741,6 +747,7 @@ func (c *Client) Logout(ctx context.Context) error {
 	r := c.run
 	session := c.sessionID
 	wasConnected := c.connState != ConnStateDisconnected
+	userID := c.userID
 	c.run = nil
 	c.state = LoginStateLogout
 	c.connState = ConnStateDisconnected
@@ -758,7 +765,7 @@ func (c *Client) Logout(ctx context.Context) error {
 	c.mu.Unlock()
 	if r == nil {
 		if wasConnected && stateCallback != nil {
-			c.emit(func() { stateCallback(ConnStateDisconnected) })
+			c.emit(func() { stateCallback(userID, ConnStateDisconnected) })
 		}
 		return nil
 	}
@@ -771,7 +778,7 @@ func (c *Client) Logout(ctx context.Context) error {
 		case err = <-r.logout:
 		case <-ctx.Done():
 			err = ctx.Err()
-		case <-time.After(c.cfg.LogoutTimeout):
+		case <-time.After(logoutTimeout):
 			err = newError(ErrTimeout, "logout", "")
 		}
 	}
@@ -786,7 +793,7 @@ func (c *Client) Logout(ctx context.Context) error {
 	}
 	r.shutdown(newError(ErrStreamClosed, "logout", "session ended"))
 	if wasConnected && stateCallback != nil {
-		c.emit(func() { stateCallback(ConnStateDisconnected) })
+		c.emit(func() { stateCallback(userID, ConnStateDisconnected) })
 	}
 	return err
 }

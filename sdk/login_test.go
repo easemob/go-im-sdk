@@ -107,8 +107,6 @@ func TestLogoutAllowsLoginAgainAndRefetchesDNS(t *testing.T) {
 
 	var dnsRequests atomic.Int32
 	config := validConfig()
-	config.ConnectTimeout = 2 * time.Second
-	config.LogoutTimeout = 2 * time.Second
 	config.HTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		dnsRequests.Add(1)
 		body := fmt.Sprintf(`{"msync-wx":{"hosts":[{"protocol":"https","port":%d,"domain":%q,"priority":1}]},"rest":{"hosts":[{"protocol":"https","port":443,"domain":"rest.example","priority":1}]}}`, port, host)

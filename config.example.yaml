@@ -19,17 +19,5 @@ domain: "easemob.com"
 # One IM user may be used by only one service instance; another service or
 # client logging in as that user will kick this connection, with no kick callback.
 resource: "550e8400-e29b-41d4-a716-446655440000"
-heartbeat_interval_seconds: 120
-heartbeat_timeout_seconds: 240
+# 是否禁用自动重连（网络断开时不自动重连）。默认 false。
 disable_reconnect: false
-connect_timeout_seconds: 15
-send_timeout_seconds: 15
-logout_timeout_seconds: 5
-max_redirect_hops: 5
-max_frame_bytes: 4194304
-write_queue_size: 256
-handler_timeout_seconds: 30
-handler_max_attempts: 3
-handler_concurrency: 4
-# PROVISION 返回 token 过期时间后，提前多少秒告警（默认 300 秒）
-token_expiry_warning_seconds: 300

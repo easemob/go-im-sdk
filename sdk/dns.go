@@ -16,7 +16,7 @@ import (
 const (
 	dnsBootstrapURL      = "https://rs.easemob.com/easemob/server.json"
 	dnsFileVersion       = "1"
-	dnsMaxAttempts       = 3
+	dnsMaxAttempts       = 2
 	dnsResponseMaxBytes  = int64(1 << 20)
 	dnsRetryInitialDelay = 100 * time.Millisecond
 )

@@ -186,16 +186,15 @@ func (r *connectionRun) processMetas(metas []internalprotocol.Meta) (err error) 
 			}
 		case internalprotocol.NamespaceStatistic:
 			r.handleStatistic(m.Payload)
-		case internalprotocol.NamespaceNotify:
-			continue
-		case internalprotocol.NamespaceMUC:
+		default:
+			// 不识别的消息类型（Notify/MUC/Roster/Conference/Query 等）直接丢弃。
 			continue
 		}
 	}
 	return nil
 }
 
-// deliverMessage 对单条消息执行 handler，最多重试 HandlerMaxAttempts 次。
+// deliverMessage 对单条消息执行 handler，最多重试 handlerMaxAttempts 次。
 // 返回错误表示该条消息需要死信；连接本身不受影响。handler panic 被当作
 // 永久失败捕获，避免一个 panic 拖垮整个批次。
 func (r *connectionRun) deliverMessage(msg *Message) (err error) {
@@ -204,12 +203,12 @@ func (r *connectionRun) deliverMessage(msg *Message) (err error) {
 			err = fmt.Errorf("handler panic: %v", v)
 		}
 	}()
-	for attempt := 1; attempt <= r.client.cfg.HandlerMaxAttempts; attempt++ {
-		ctx, cancel := context.WithTimeout(r.ctx, r.client.cfg.HandlerTimeout)
+	for attempt := 1; attempt <= handlerMaxAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(r.ctx, handlerTimeout)
 		// 协作式超时的兜底观测：Go 无法强制终止不合作的 handler。若 handler
 		// 忽略 context、在超时后仍未返回，这里记录告警，帮助业务方发现并
 		// 修复不检查 ctx 的 handler，避免其永久占用 worker 槽位并跨重连累积。
-		watchdog := time.AfterFunc(r.client.cfg.HandlerTimeout, func() {
+		watchdog := time.AfterFunc(handlerTimeout, func() {
 			r.client.stuckHandlers.Add(1)
 			r.client.logger.Error("message handler ignored its context and is still running",
 				"meta_id", msg.MetaID)
@@ -225,7 +224,7 @@ func (r *connectionRun) deliverMessage(msg *Message) (err error) {
 		if err == nil {
 			return nil
 		}
-		if attempt < r.client.cfg.HandlerMaxAttempts {
+		if attempt < handlerMaxAttempts {
 			select {
 			case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
 			case <-r.ctx.Done():
@@ -319,7 +318,7 @@ func (c *Client) Send(ctx context.Context, req SendRequest) (*SendResult, error)
 	r.pending[id] = wait
 	r.pendingMu.Unlock()
 	defer func() { r.pendingMu.Lock(); delete(r.pending, id); r.pendingMu.Unlock() }()
-	sendCtx, cancel := context.WithTimeout(ctx, c.cfg.SendTimeout)
+	sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
 	if err = r.sendFrame(sendCtx, frame); err != nil {
 		return nil, err

@@ -59,13 +59,8 @@ func main() {
 	var client *imsdk.Client
 	client, err = imsdk.New(imsdk.Config{
 		AppKey: fc.AppKey, Domain: fc.Domain, Resource: fc.Resource,
-		HeartbeatInterval: seconds(fc.HeartbeatIntervalSeconds), HeartbeatTimeout: seconds(fc.HeartbeatTimeoutSeconds),
-		ConnectTimeout: seconds(fc.ConnectTimeoutSeconds), SendTimeout: seconds(fc.SendTimeoutSeconds),
-		LogoutTimeout: seconds(fc.LogoutTimeoutSeconds), DisableReconnect: fc.DisableReconnect,
-		MaxRedirectHops: fc.MaxRedirectHops, MaxFrameBytes: fc.MaxFrameBytes, WriteQueueSize: fc.WriteQueueSize,
-		HandlerTimeout: seconds(fc.HandlerTimeoutSeconds), HandlerMaxAttempts: fc.HandlerMaxAttempts,
-		HandlerConcurrency: fc.HandlerConcurrency, TokenExpiryWarningBefore: seconds(fc.TokenExpiryWarningSeconds),
-		Logger: logger, Debug: *debug,
+		DisableReconnect: fc.DisableReconnect,
+		Logger:           logger, Debug: *debug,
 		MessageHandler: func(_ context.Context, msg *imsdk.Message) error {
 			full, marshalErr := marshalSafeMessage(msg)
 			attrs := []any{"meta_id", msg.MetaID, "from", msg.From, "to", msg.To,
@@ -83,16 +78,18 @@ func main() {
 			logger.Info("message.received", attrs...)
 			return nil
 		},
-		OnConnectionStateChanged: func(state imsdk.ConnState) {
+		OnConnectionStateChanged: func(userID string, state imsdk.ConnState) {
 			h := client.Health()
-			logger.Info("connection.state", "state", state.String(), "session_id", h.SessionID,
+			logger.Info("connection.state", "user_id", userID, "state", state.String(), "session_id", h.SessionID,
 				"generation", h.ConnectionGeneration)
 		},
-		OnDisconnect: func(err error) {
-			logger.Warn("connection.disconnected", "error", err, "health", client.Health())
+		OnDisconnect: func(userID string, err error) {
+			logger.Warn("connection.disconnected", "user_id", userID, "error", err, "health", client.Health())
 		},
-		OnTokenExpired:    func() { logger.Warn("token.expired") },
-		OnTokenWillExpire: func(at time.Time) { logger.Warn("token.will_expire", "expires_at", at.UTC().Format(time.RFC3339)) },
+		OnTokenExpired: func(userID string) { logger.Warn("token.expired", "user_id", userID) },
+		OnTokenWillExpire: func(userID string, at time.Time) {
+			logger.Warn("token.will_expire", "user_id", userID, "expires_at", at.UTC().Format(time.RFC3339))
+		},
 	})
 	if err != nil {
 		logger.Error("integration SDK initialization failed", "error", err)
@@ -100,7 +97,7 @@ func main() {
 	}
 	defer client.Close(context.Background())
 
-	ctx, cancel := context.WithTimeout(context.Background(), durationOr(fc.ConnectTimeoutSeconds, 15))
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	err = client.Login(ctx, fc.UserID, fc.Token)
 	cancel()
 	if err != nil {
@@ -199,7 +196,7 @@ func main() {
 	sig := <-sigCh
 	signal.Stop(sigCh)
 	logger.Info("shutdown.requested", "signal", sig.String())
-	shutdown, cancelShutdown := context.WithTimeout(context.Background(), durationOr(fc.LogoutTimeoutSeconds, 5))
+	shutdown, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := client.Logout(shutdown); err != nil {
 		logger.Warn("logout.failed", "error", err)
 	}
@@ -339,31 +336,13 @@ func logRESTError(logger *slog.Logger, msg string, err error) {
 	logger.Error(msg, "error", err)
 }
 
-func seconds(v int) time.Duration {
-	if v <= 0 {
-		return 0
-	}
-	return time.Duration(v) * time.Second
-}
-
-func durationOr(v, fallback int) time.Duration {
-	if v <= 0 {
-		v = fallback
-	}
-	return time.Duration(v) * time.Second
-}
-
 // Reuse the deliberately strict deployment parser from cmd/server without a
 // new dependency. The demo is copied into this package at release time.
 func loadConfig(path string) (fileConfig, error) { return parseConfig(path) }
 
 type fileConfig struct {
-	AppKey, UserID, Token, Domain, Resource                                                  string
-	HeartbeatIntervalSeconds, HeartbeatTimeoutSeconds, ConnectTimeoutSeconds                 int
-	SendTimeoutSeconds, LogoutTimeoutSeconds, MaxRedirectHops, WriteQueueSize                int
-	HandlerTimeoutSeconds, HandlerMaxAttempts, HandlerConcurrency, TokenExpiryWarningSeconds int
-	MaxFrameBytes                                                                            int64
-	DisableReconnect                                                                         bool
+	AppKey, UserID, Token, Domain, Resource string
+	DisableReconnect                        bool
 }
 
 func parseConfig(path string) (fileConfig, error) {
@@ -398,30 +377,6 @@ func parseConfig(path string) (fileConfig, error) {
 			c.Domain = value
 		case "resource":
 			c.Resource = value
-		case "heartbeat_interval_seconds":
-			c.HeartbeatIntervalSeconds, _ = atoi(value)
-		case "heartbeat_timeout_seconds":
-			c.HeartbeatTimeoutSeconds, _ = atoi(value)
-		case "connect_timeout_seconds":
-			c.ConnectTimeoutSeconds, _ = atoi(value)
-		case "send_timeout_seconds":
-			c.SendTimeoutSeconds, _ = atoi(value)
-		case "logout_timeout_seconds":
-			c.LogoutTimeoutSeconds, _ = atoi(value)
-		case "max_redirect_hops":
-			c.MaxRedirectHops, _ = atoi(value)
-		case "write_queue_size":
-			c.WriteQueueSize, _ = atoi(value)
-		case "handler_timeout_seconds":
-			c.HandlerTimeoutSeconds, _ = atoi(value)
-		case "handler_max_attempts":
-			c.HandlerMaxAttempts, _ = atoi(value)
-		case "handler_concurrency":
-			c.HandlerConcurrency, _ = atoi(value)
-		case "token_expiry_warning_seconds":
-			c.TokenExpiryWarningSeconds, _ = atoi(value)
-		case "max_frame_bytes":
-			c.MaxFrameBytes, _ = atoi64(value)
 		case "disable_reconnect":
 			c.DisableReconnect = value == "true"
 		}
@@ -475,6 +430,3 @@ func stripYAMLComment(line string) string {
 	}
 	return line
 }
-
-func atoi(v string) (int, error)     { var n int; _, e := fmt.Sscan(v, &n); return n, e }
-func atoi64(v string) (int64, error) { var n int64; _, e := fmt.Sscan(v, &n); return n, e }

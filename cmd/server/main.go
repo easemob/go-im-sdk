@@ -25,25 +25,13 @@ const (
 )
 
 type fileConfig struct {
-	AppKey                    string
-	UserID                    string
-	Token                     string
-	TokenFile                 string
-	Domain                    string
-	Resource                  string
-	HeartbeatIntervalSeconds  int
-	HeartbeatTimeoutSeconds   int
-	DisableReconnect          bool
-	ConnectTimeoutSeconds     int
-	SendTimeoutSeconds        int
-	LogoutTimeoutSeconds      int
-	MaxRedirectHops           int
-	MaxFrameBytes             int64
-	WriteQueueSize            int
-	HandlerTimeoutSeconds     int
-	HandlerMaxAttempts        int
-	HandlerConcurrency        int
-	TokenExpiryWarningSeconds int
+	AppKey           string
+	UserID           string
+	Token            string
+	TokenFile        string
+	Domain           string
+	Resource         string
+	DisableReconnect bool
 }
 
 func main() {
@@ -63,36 +51,26 @@ func main() {
 	}
 
 	client, err := imsdk.New(imsdk.Config{
-		AppKey:                   fc.AppKey,
-		Domain:                   fc.Domain,
-		Resource:                 fc.Resource,
-		HeartbeatInterval:        seconds(fc.HeartbeatIntervalSeconds),
-		HeartbeatTimeout:         seconds(fc.HeartbeatTimeoutSeconds),
-		ConnectTimeout:           seconds(fc.ConnectTimeoutSeconds),
-		SendTimeout:              seconds(fc.SendTimeoutSeconds),
-		LogoutTimeout:            seconds(fc.LogoutTimeoutSeconds),
-		DisableReconnect:         fc.DisableReconnect,
-		MaxRedirectHops:          fc.MaxRedirectHops,
-		MaxFrameBytes:            fc.MaxFrameBytes,
-		WriteQueueSize:           fc.WriteQueueSize,
-		HandlerTimeout:           seconds(fc.HandlerTimeoutSeconds),
-		HandlerMaxAttempts:       fc.HandlerMaxAttempts,
-		HandlerConcurrency:       fc.HandlerConcurrency,
-		TokenExpiryWarningBefore: seconds(fc.TokenExpiryWarningSeconds),
-		Logger:                   logger,
+		AppKey:           fc.AppKey,
+		Domain:           fc.Domain,
+		Resource:         fc.Resource,
+		DisableReconnect: fc.DisableReconnect,
+		Logger:           logger,
 		MessageHandler: func(_ context.Context, msg *imsdk.Message) error {
 			// Persist or dispatch the message transactionally here. Returning nil
 			// acknowledges the queue batch; return an error to prevent acknowledgement.
 			logger.Info("message received", "meta_id", msg.MetaID, "from", msg.From, "is_group", msg.IsGroup)
 			return nil
 		},
-		OnConnectionStateChanged: func(state imsdk.ConnState) {
-			logger.Info("IM connection state changed", "state", state.String())
+		OnConnectionStateChanged: func(userID string, state imsdk.ConnState) {
+			logger.Info("IM connection state changed", "user_id", userID, "state", state.String())
 		},
-		OnDisconnect:   func(err error) { logger.Warn("IM session disconnected", "error", err) },
-		OnTokenExpired: func() { logger.Warn("IM token expired") },
-		OnTokenWillExpire: func(expiresAt time.Time) {
-			logger.Warn("IM token will expire", "expires_at", expiresAt.UTC().Format(time.RFC3339))
+		OnDisconnect: func(userID string, err error) {
+			logger.Warn("IM session disconnected", "user_id", userID, "error", err)
+		},
+		OnTokenExpired: func(userID string) { logger.Warn("IM token expired", "user_id", userID) },
+		OnTokenWillExpire: func(userID string, expiresAt time.Time) {
+			logger.Warn("IM token will expire", "user_id", userID, "expires_at", expiresAt.UTC().Format(time.RFC3339))
 		},
 	})
 	if err != nil {
@@ -100,7 +78,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	connectCtx, cancelConnect := context.WithTimeout(context.Background(), durationOr(fc.ConnectTimeoutSeconds, 15))
+	connectCtx, cancelConnect := context.WithTimeout(context.Background(), 15*time.Second)
 	err = client.Login(connectCtx, fc.UserID, fc.Token)
 	cancelConnect()
 	if err != nil {
@@ -115,7 +93,7 @@ func main() {
 	signal.Stop(sigCh)
 	logger.Info("shutdown requested", "signal", sig.String())
 
-	shutdownTimeout := durationOr(fc.LogoutTimeoutSeconds, 5)
+	shutdownTimeout := 5 * time.Second
 	logoutCtx, cancelLogout := context.WithTimeout(context.Background(), shutdownTimeout)
 	logoutErr := client.Logout(logoutCtx)
 	cancelLogout()
@@ -133,20 +111,6 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
-func seconds(value int) time.Duration {
-	if value == 0 {
-		return 0
-	}
-	return time.Duration(value) * time.Second
-}
-
-func durationOr(value, fallback int) time.Duration {
-	if value <= 0 {
-		value = fallback
-	}
-	return time.Duration(value) * time.Second
-}
-
 // loadConfig parses the deliberately flat YAML schema used by the example.
 // Keeping the deployment parser small avoids adding a YAML library to the SDK.
 func loadConfig(path string) (fileConfig, error) {
@@ -157,11 +121,7 @@ func loadConfig(path string) (fileConfig, error) {
 	known := map[string]bool{
 		"app_key": true, "user_id": true,
 		"token": true, "token_file": true, "domain": true, "resource": true,
-		"heartbeat_interval_seconds": true, "heartbeat_timeout_seconds": true, "disable_reconnect": true,
-		"connect_timeout_seconds": true, "send_timeout_seconds": true, "logout_timeout_seconds": true,
-		"max_redirect_hops": true, "max_frame_bytes": true, "write_queue_size": true,
-		"handler_timeout_seconds": true, "handler_max_attempts": true, "handler_concurrency": true,
-		"token_expiry_warning_seconds": true,
+		"disable_reconnect": true,
 	}
 	for key := range values {
 		if !known[key] {
@@ -196,45 +156,6 @@ func loadConfig(path string) (fileConfig, error) {
 		return fileConfig{}, fmt.Errorf("token is required: set %s, %s, token_file, or token", tokenEnv, tokenFileEnv)
 	}
 
-	if fc.HeartbeatIntervalSeconds, err = positiveInt(values, "heartbeat_interval_seconds"); err != nil {
-		return fileConfig{}, err
-	}
-	if fc.HeartbeatTimeoutSeconds, err = positiveInt(values, "heartbeat_timeout_seconds"); err != nil {
-		return fileConfig{}, err
-	}
-	if fc.ConnectTimeoutSeconds, err = positiveInt(values, "connect_timeout_seconds"); err != nil {
-		return fileConfig{}, err
-	}
-	if fc.SendTimeoutSeconds, err = positiveInt(values, "send_timeout_seconds"); err != nil {
-		return fileConfig{}, err
-	}
-	if fc.LogoutTimeoutSeconds, err = positiveInt(values, "logout_timeout_seconds"); err != nil {
-		return fileConfig{}, err
-	}
-	if fc.MaxRedirectHops, err = positiveInt(values, "max_redirect_hops"); err != nil {
-		return fileConfig{}, err
-	}
-	if fc.WriteQueueSize, err = positiveInt(values, "write_queue_size"); err != nil {
-		return fileConfig{}, err
-	}
-	if fc.HandlerTimeoutSeconds, err = positiveInt(values, "handler_timeout_seconds"); err != nil {
-		return fileConfig{}, err
-	}
-	if fc.HandlerMaxAttempts, err = positiveInt(values, "handler_max_attempts"); err != nil {
-		return fileConfig{}, err
-	}
-	if fc.HandlerConcurrency, err = positiveInt(values, "handler_concurrency"); err != nil {
-		return fileConfig{}, err
-	}
-	if fc.TokenExpiryWarningSeconds, err = positiveInt(values, "token_expiry_warning_seconds"); err != nil {
-		return fileConfig{}, err
-	}
-	if raw := values["max_frame_bytes"]; raw != "" {
-		fc.MaxFrameBytes, err = strconv.ParseInt(raw, 10, 64)
-		if err != nil || fc.MaxFrameBytes <= 0 {
-			return fileConfig{}, fmt.Errorf("max_frame_bytes must be a positive integer")
-		}
-	}
 	if raw := values["disable_reconnect"]; raw != "" {
 		fc.DisableReconnect, err = strconv.ParseBool(raw)
 		if err != nil {
@@ -242,18 +163,6 @@ func loadConfig(path string) (fileConfig, error) {
 		}
 	}
 	return fc, nil
-}
-
-func positiveInt(values map[string]string, key string) (int, error) {
-	raw := values[key]
-	if raw == "" {
-		return 0, nil
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n <= 0 {
-		return 0, fmt.Errorf("%s must be a positive integer", key)
-	}
-	return n, nil
 }
 
 func readFlatYAML(path string) (map[string]string, error) {

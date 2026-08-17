@@ -49,11 +49,11 @@ func main() {
             // 先可靠持久化/投递；返回 nil 后 SDK 才推进队列。
             return persistIdempotently(ctx, msg.MetaID, msg)
         },
-        OnConnectionStateChanged: func(state imsdk.ConnState) {
-            log.Printf("IM connection state: %s", state)
+        OnConnectionStateChanged: func(userID string, state imsdk.ConnState) {
+            log.Printf("IM connection state (%s): %s", userID, state)
         },
-        OnDisconnect: func(err error) { log.Printf("IM disconnected: %v", err) },
-        OnTokenExpired: func() { log.Print("IM token expired") },
+        OnDisconnect: func(userID string, err error) { log.Printf("IM disconnected (%s): %v", userID, err) },
+        OnTokenExpired: func(userID string) { log.Printf("IM token expired (%s)", userID) },
     })
     if err != nil { log.Fatal(err) }
     defer client.Close(context.Background())
@@ -72,17 +72,18 @@ SDK 固定请求 `https://rs.easemob.com/easemob/server.json`，并携带 `sdk_v
 
 `Resource` 是必填的原始稳定设备身份，首次部署时应生成 UUID 一类具有足够随机性的字符串。业务必须持久化原始值；同一逻辑服务发生宕机、重启或故障转移时必须继续使用原值。更换 Resource 会被服务端视为从另一台设备登录。已经上线的实例即使旧值不是 UUID 格式，也必须继续使用已持久化的旧值，不能为了改格式而替换。SDK 不自动生成或持久化 Resource。SDK 实际使用 `go-server-imsdk-<resource>`；前缀计入最终 128 字符限制，最终值不得包含空白、`/` 或 `@`。
 
-一个 IM 用户只能供一个服务实例在线使用。不要让多个服务实例共享同一用户，也不要同时在其他 Client 或设备登录该用户；后登录的实例或 Client 会导致当前服务连接被踢下线。SDK 目前没有单独的“被踢”回调，业务必须自行保证账号独占，并通过 `OnDisconnect(error)` 和 SDK 错误码观察连接终止。
+一个 IM 用户只能供一个服务实例在线使用。不要让多个服务实例共享同一用户，也不要同时在其他 Client 或设备登录该用户；后登录的实例或 Client 会导致当前服务连接被踢下线。SDK 目前没有单独的“被踢”回调，业务必须自行保证账号独占，并通过 `OnDisconnect(userID, error)` 和 SDK 错误码观察连接终止。
 
-默认值：心跳间隔 120 秒、心跳超时 240 秒、连接/发送超时 15 秒、登出超时 5 秒、
-最大帧 4 MiB、写队列 256、handler 超时 30 秒、重试 3 次、跨队列并发 4。
+超时、重试次数、队列大小等调优参数为 SDK 固定常量（不再暴露为 `Config` 配置项）：
+心跳间隔 120 秒、心跳超时 240 秒、连接/发送超时 15 秒、登出超时 5 秒、最大帧 4 MiB、
+写队列 256、handler 超时 30 秒、重试 3 次、跨队列并发 4、token 提前告警 5 分钟。
+代码开源，如需调整请 fork 后自行修改 `sdk/client.go` 中的常量。
 
 所有要使用的 listener 都必须在 `New` 的 `Config` 中传入，登录后不动态补注册，也不补发历史事件。这确保首批同步消息能被初始化时的 `MessageHandler` 接收。生产程序应处理 `OnDisconnect`、`OnTokenWillExpire` 和 `OnTokenExpired`。listener 必须快速返回，不要在回调中执行长时间阻塞任务。
 这些业务性断开不会自动重连。登录 token 的申请、刷新和持久化由业务负责；SDK 只维护当前会话的内存 token，业务主动刷新后可调用 `UpdateToken`。
 
 PROVISION 的 `auth_token.expires_in` 会被记录为绝对过期时间（兼容秒/毫秒时间戳及相对秒数）。业务可用
-`TokenExpiresAt()` 查询，也可注册 `OnTokenWillExpire` 接收提前告警；默认提前 5 分钟，使用
-`Config.TokenExpiryWarningBefore` 调整。示例程序对应 `token_expiry_warning_seconds`。
+`TokenExpiresAt()` 查询，也可注册 `OnTokenWillExpire` 接收提前告警；默认提前 5 分钟（固定常量，可在 fork 中调整）。
 
 ## 生命周期与消息流
 
@@ -175,10 +176,10 @@ sequenceDiagram
 | 回调 | 必填 | 触发时机 | 运行线程 |
 |---|---|---|---|
 | `MessageHandler(ctx, *Message) error` | ✅ | 每条收到的聊天消息（at-least-once） | batchWorker 池 |
-| `OnConnectionStateChanged(ConnState)` | — | 连接状态变化 | 事件分发协程 |
-| `OnDisconnect(error)` | — | 业务性断开，不会自动重连 | 事件分发协程 |
-| `OnTokenExpired()` | — | 登录 token 已过期 | 事件分发协程 |
-| `OnTokenWillExpire(time.Time)` | — | token 即将过期（提前告警） | 事件分发协程 |
+| `OnConnectionStateChanged(userID, ConnState)` | — | 连接状态变化 | 事件分发协程 |
+| `OnDisconnect(userID, error)` | — | 业务性断开，不会自动重连 | 事件分发协程 |
+| `OnTokenExpired(userID)` | — | 登录 token 已过期 | 事件分发协程 |
+| `OnTokenWillExpire(userID, time.Time)` | — | token 即将过期（提前告警） | 事件分发协程 |
 
 ### MessageHandler（消息处理）
 
@@ -197,11 +198,11 @@ MessageHandler: func(ctx context.Context, msg *imsdk.Message) error {
 
 ### OnConnectionStateChanged
 
-`ConnState` 取值：`ConnStateDisconnected` / `ConnStateConnecting` / `ConnStateConnected` / `ConnStateReconnecting`。用于展示在线状态与 ready 判定（通常 `Connected()` 为 true 才报 ready）。
+`OnConnectionStateChanged(userID, state)` 在连接状态变化时触发，`userID` 为当前登录用户。`ConnState` 取值：`ConnStateDisconnected` / `ConnStateConnecting` / `ConnStateConnected` / `ConnStateReconnecting`。用于展示在线状态与 ready 判定（通常 `Connected()` 为 true 才报 ready）。
 
 ### OnDisconnect
 
-仅在**业务性断开（不会自动重连）**时触发。通过 `errorCode(err)` 区分原因：
+`OnDisconnect(userID, err)` 仅在**业务性断开（不会自动重连）**时触发，`userID` 为断开时的登录用户。通过 `errorCode(err)` 区分原因：
 
 | 错误码 | 含义 | 建议 |
 |---|---|---|
@@ -216,8 +217,8 @@ MessageHandler: func(ctx context.Context, msg *imsdk.Message) error {
 
 ### OnTokenExpired / OnTokenWillExpire
 
-- `OnTokenExpired`：登录后服务端判定 token 已过期，连接进入终态（同时触发 `OnDisconnect`），需重新走 `Login`。
-- `OnTokenWillExpire`：由 PROVISION 的 `expires_in` 计算绝对过期时间，提前 `TokenExpiryWarningBefore`（默认 5 分钟）回调；业务可借此刷新 token 并调用 `UpdateToken`，也可用 `TokenExpiresAt()` 主动查询。
+- `OnTokenExpired(userID)`：登录后服务端判定 token 已过期，连接进入终态（同时触发 `OnDisconnect`），需重新走 `Login`。
+- `OnTokenWillExpire(userID, expiresAt)`：由 PROVISION 的 `expires_in` 计算绝对过期时间，提前 `tokenExpiryWarningBefore`（默认 5 分钟）回调；业务可借此刷新 token 并调用 `UpdateToken`，也可用 `TokenExpiresAt()` 主动查询。
 
 ### 回调注意事项
 

@@ -39,7 +39,7 @@ token_file: "/run/secrets/easemob-token"
 - `resource` 在首次部署时使用 UUID 一类的原始稳定值，由业务生成并持久化。同一逻辑服务发生宕机、重启或故障转移时必须复用原值；换值会被服务端视为换设备登录。已经使用过的旧值即使不是 UUID 格式也不得替换。SDK 实际使用 `go-server-imsdk-<resource>`，前缀计入最终 128 字符限制，最终值不能包含空白、`/` 或 `@`。
 - token 推荐放在权限为 `0600` 的文件中，也可以使用 `GO_IM_SDK_TOKEN_FILE` 或 `GO_IM_SDK_TOKEN`。
 
-一个 IM 用户只能用于一个在线服务实例。测试时不要使用同一用户再启动第二个 Demo，也不要在其他 Client 或设备登录该用户，否则后登录的一方会把当前服务连接踢下线。目前 SDK 没有独立的被踢回调；业务需要自行保证账号独占，并从 `OnDisconnect(error)` 和 SDK 错误码判断连接已经终止。
+一个 IM 用户只能用于一个在线服务实例。测试时不要使用同一用户再启动第二个 Demo，也不要在其他 Client 或设备登录该用户，否则后登录的一方会把当前服务连接踢下线。目前 SDK 没有独立的被踢回调；业务需要自行保证账号独占，并从 `OnDisconnect(userID, error)` 和 SDK 错误码判断连接已经终止。
 
 不再配置 `msync_host`、`rest_base` 或 `sdk_version`。Demo 先用 `AppKey` 和原始 resource 初始化 Client，在 `Config` 中一次性绑定 `MessageHandler` 和所有 listener，再调用 `Login(ctx, userID, token)`。首批同步消息因此不会早于 handler 注册；SDK 不补发历史回调，listener 也不应长时间阻塞。Login 固定请求：
 

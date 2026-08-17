@@ -12,7 +12,7 @@ func TestCloseFromEventCallbackDoesNotDeadlock(t *testing.T) {
 	done := make(chan struct{})
 	var c *Client
 	config := validConfig()
-	config.OnConnectionStateChanged = func(ConnState) { _ = c.Close(context.Background()); close(done) }
+	config.OnConnectionStateChanged = func(string, ConnState) { _ = c.Close(context.Background()); close(done) }
 	var err error
 	c, err = New(config)
 	if err != nil {

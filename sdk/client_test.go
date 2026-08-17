@@ -26,8 +26,8 @@ func TestConfigDefaultsAndSecurity(t *testing.T) {
 	if c.cfg.Resource != "go-server-imsdk-service-01" {
 		t.Fatalf("resource=%s", c.cfg.Resource)
 	}
-	if c.cfg.MaxFrameBytes != 4<<20 || c.cfg.HeartbeatInterval != 120*time.Second {
-		t.Fatal("defaults not applied")
+	if maxFrameBytes != 4<<20 || heartbeatInterval != 120*time.Second {
+		t.Fatal("fixed tuning constants changed unexpectedly")
 	}
 	bad := validConfig()
 	bad.AppKey = "invalid"
@@ -56,10 +56,10 @@ func TestResourceIsRequiredAndValidated(t *testing.T) {
 
 func TestListenersAreBoundDuringInitialization(t *testing.T) {
 	config := validConfig()
-	config.OnConnectionStateChanged = func(ConnState) {}
-	config.OnDisconnect = func(error) {}
-	config.OnTokenExpired = func() {}
-	config.OnTokenWillExpire = func(time.Time) {}
+	config.OnConnectionStateChanged = func(string, ConnState) {}
+	config.OnDisconnect = func(string, error) {}
+	config.OnTokenExpired = func(string) {}
+	config.OnTokenWillExpire = func(string, time.Time) {}
 	c, err := New(config)
 	if err != nil {
 		t.Fatal(err)
@@ -157,7 +157,7 @@ func TestTokenExpiryTimeFormats(t *testing.T) {
 func TestProvisionTokenExpiryIsRecordedAndWarned(t *testing.T) {
 	config := validConfig()
 	warned := make(chan time.Time, 1)
-	config.OnTokenWillExpire = func(at time.Time) { warned <- at }
+	config.OnTokenWillExpire = func(_ string, at time.Time) { warned <- at }
 	c, err := New(config)
 	if err != nil {
 		t.Fatal(err)
