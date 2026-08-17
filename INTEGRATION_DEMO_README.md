@@ -6,7 +6,7 @@
 
 ## 一、准备环境
 
-在 `<go-im-sdk-repo>/GO_IM_SDK` 目录执行：
+在 `<go-im-sdk-repo>` 目录执行：
 
 ```bash
 go version

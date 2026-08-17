@@ -45,7 +45,7 @@ go test ./...
 
 ```bash
 cd /path/to/your-business-project
-go mod edit -replace=github.com/easemob/go-im-sdk=/Users/zhujichao_1/Documents/Desktop/go-im-sdk/GO_IM_SDK
+go mod edit -replace=github.com/easemob/go-im-sdk=/path/to/go-im-sdk
 go mod edit -require=github.com/easemob/go-im-sdk@v0.0.0
 go mod tidy
 go test ./...

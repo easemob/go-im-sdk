@@ -1,0 +1,28 @@
+# Copy this file to a deployment-specific path and keep credentials out of it.
+# Environment priority: GO_IM_SDK_TOKEN, GO_IM_SDK_TOKEN_FILE, token_file, token.
+app_key: "easemob#easeim"
+user_id: "xu"
+
+# Recommended: mount a 0600 secret file and set its path here, or set
+# GO_IM_SDK_TOKEN_FILE. GO_IM_SDK_TOKEN is useful for short-lived environments.
+token_file: ""
+# Last-resort inline token. If non-empty, this YAML file must be mode 0600.
+token: "YWMtMV_xcJb7EfGod4kKIoTvk1zzvlQ7sUrSpVuQGlyIzFSOTJ1wgwsR8K7Uwf5qp-67AwMAAAGf-n-9nAAFfkDyncBIiJj7LyCHHX3jRSWEEuTJ6jT3zVjAJKRODI4i9g"
+
+domain: "easemob.com"
+resource: "golang-server-xu"
+sdk_version: "4.0.0-go"
+heartbeat_interval_seconds: 120
+heartbeat_timeout_seconds: 240
+disable_reconnect: false
+connect_timeout_seconds: 15
+send_timeout_seconds: 15
+logout_timeout_seconds: 5
+max_redirect_hops: 5
+max_frame_bytes: 4194304
+write_queue_size: 256
+handler_timeout_seconds: 30
+handler_max_attempts: 3
+handler_concurrency: 4
+# PROVISION 返回 token 过期时间后，提前多少秒告警（默认 300 秒）
+token_expiry_warning_seconds: 300

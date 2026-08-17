@@ -464,7 +464,7 @@ FAIL(1) + reason 子串匹配（contains，顺序敏感）：
 ## 6. 文件结构
 
 ```
-GO_IM_SDK/
+.
 ├── go.mod / go.sum          module: 发布前确定的正式可引用路径（禁止使用裸 `emgosdk`）
 ├── README.md                使用/部署文档
 ├── PLAN.md                  本计划
