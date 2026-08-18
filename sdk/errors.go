@@ -41,6 +41,7 @@ const (
 	ErrRedirectLimit      ErrorCode = "REDIRECT_LIMIT"
 	ErrHandlerFailed      ErrorCode = "HANDLER_FAILED"
 	ErrHandlerBacklog     ErrorCode = "HANDLER_BACKLOG"
+	ErrCallbackBacklog    ErrorCode = "CALLBACK_BACKLOG"
 	ErrKickedChangePass   ErrorCode = "KICKED_BY_PASSWORD_CHANGE"
 	ErrSendOutcomeUnknown ErrorCode = "SEND_OUTCOME_UNKNOWN"
 	ErrMessageIDExhausted ErrorCode = "MESSAGE_ID_EXHAUSTED"

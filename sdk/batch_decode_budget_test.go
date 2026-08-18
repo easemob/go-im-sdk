@@ -28,7 +28,7 @@ func (c *budgetTestCodec) DecodeFrame([]byte) (*internalprotocol.Frame, error) {
 
 func newDecodeBudgetRun(codec internalprotocol.Codec, budget *byteBudget, wait time.Duration) (*Client, *connectionRun, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
-	client := &Client{codec: codec, logger: defaultLogger(), eventCtx: context.Background()}
+	client := &Client{codec: codec, logger: defaultLogger(), lifetimeCtx: context.Background()}
 	client.generation.Store(1)
 	return client, &connectionRun{client: client, ctx: ctx, cancel: cancel, generation: 1, decodeBudget: budget, decodeWait: wait}, cancel
 }
@@ -173,7 +173,7 @@ func TestBatchWorkerReleasesOnPanicAndOldGeneration(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			client := &Client{logger: defaultLogger(), eventCtx: context.Background()}
+			client := &Client{logger: defaultLogger(), lifetimeCtx: context.Background()}
 			client.generation.Store(1)
 			runGeneration := uint64(1)
 			if oldGeneration {

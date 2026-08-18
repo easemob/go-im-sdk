@@ -491,17 +491,17 @@ func (r *connectionRun) handleBatch(d *internalprotocol.Sync) {
 
 // batchWorker 消费 Client 级批次队列。worker 是 Client 级固定池，跨连接代际共享，
 // 重连不会创建新 worker；不计入任何 WaitGroup：handler 是不可信的用户代码，可能
-// 忽略 context 长期阻塞，计入 wg 会让 Close 永久等待。worker 依靠 eventCtx 退出。
+// 忽略 context 长期阻塞，计入 wg 会让 Close 永久等待。worker 依靠 lifetimeCtx 退出。
 // 取出任务后由 job.r.processBatch 内部的 ctx/generation 检查丢弃旧连接的任务。
 func (c *Client) batchWorker() {
 	for {
-		if c.eventCtx.Err() != nil {
+		if c.lifetimeCtx.Err() != nil {
 			return
 		}
 		select {
 		case job := <-c.batches:
 			c.processBatchJob(job)
-		case <-c.eventCtx.Done():
+		case <-c.lifetimeCtx.Done():
 			return
 		}
 	}
@@ -530,7 +530,7 @@ func (c *Client) processBatchJob(job batchJob) {
 		}
 	}()
 	if job.reservation == nil || job.r == nil || job.r.ctx == nil || job.r.ctx.Err() != nil ||
-		job.r.generation != c.generation.Load() || (c.eventCtx != nil && c.eventCtx.Err() != nil) {
+		job.r.generation != c.generation.Load() || (c.lifetimeCtx != nil && c.lifetimeCtx.Err() != nil) {
 		return
 	}
 	job.r.processBatch(job.queue, job.d)

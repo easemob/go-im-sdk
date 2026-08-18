@@ -53,22 +53,23 @@ func (fn lifecycleContextRoundTripFunc) RoundTrip(req *http.Request) (*http.Resp
 }
 
 func newLifecycleContextClient(transport http.RoundTripper) (*Client, *lifecycleContextCodec) {
-	eventCtx, eventCancel := context.WithCancel(context.Background())
+	lifetimeCtx, lifetimeCancel := context.WithCancel(context.Background())
 	codec := &lifecycleContextCodec{closed: make(chan struct{})}
 	return &Client{
 		cfg: Config{
 			AppKey:     "org#app",
 			HTTPClient: &http.Client{Transport: transport},
 		},
-		logger:      defaultLogger(),
-		state:       LoginStateLogout,
-		connState:   ConnStateDisconnected,
-		eventCtx:    eventCtx,
-		eventCancel: eventCancel,
-		events:      make(chan func(), writeQueueSize),
-		batches:     make(chan batchJob, writeQueueSize),
-		codec:       codec,
-		closeDone:   make(chan struct{}),
+		logger:         defaultLogger(),
+		state:          LoginStateLogout,
+		connState:      ConnStateDisconnected,
+		lifetimeCtx:    lifetimeCtx,
+		lifetimeCancel: lifetimeCancel,
+		events:         make(chan func(), writeQueueSize),
+		terminalWake:   make(chan struct{}, 1),
+		batches:        make(chan batchJob, writeQueueSize),
+		codec:          codec,
+		closeDone:      make(chan struct{}),
 		wsDialer: &websocket.Dialer{
 			HandshakeTimeout: connectTimeout,
 			Proxy:            http.ProxyFromEnvironment,
@@ -204,7 +205,6 @@ func TestCloseFromEventCallbackPortableDoesNotDeadlock(t *testing.T) {
 		_ = client.Close(context.Background())
 		close(done)
 	}
-	client.eventWG.Add(1)
 	go client.dispatchEvents()
 	client.setStates(LoginStateLoggedIn, ConnStateConnected)
 	select {
@@ -214,5 +214,19 @@ func TestCloseFromEventCallbackPortableDoesNotDeadlock(t *testing.T) {
 	}
 	if got := codec.closeCount.Load(); got != 1 {
 		t.Fatalf("codec Close count=%d, want exactly one", got)
+	}
+}
+
+func TestEmitDropsEventAfterLifetimeCancellation(t *testing.T) {
+	lifetimeCtx, lifetimeCancel := context.WithCancel(context.Background())
+	client := &Client{
+		logger:      defaultLogger(),
+		lifetimeCtx: lifetimeCtx,
+		events:      make(chan func(), 1),
+	}
+	lifetimeCancel()
+	client.emit(func() { t.Error("canceled Client dispatched an event") })
+	if got := len(client.events); got != 0 {
+		t.Fatalf("canceled Client queued %d event(s)", got)
 	}
 }

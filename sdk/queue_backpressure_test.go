@@ -23,7 +23,7 @@ func newQueueTestRun(t *testing.T, localBudget int64) (*Client, *connectionRun) 
 		logger:      defaultLogger(),
 		batches:     make(chan batchJob, 512),
 		batchBudget: mustNewByteBudget(clientBatchBudgetBytes),
-		eventCtx:    context.Background(),
+		lifetimeCtx: context.Background(),
 		codec:       &lifecycleContextCodec{closed: make(chan struct{})},
 	}
 	client.generation.Store(1)

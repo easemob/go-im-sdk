@@ -35,6 +35,12 @@ type provisionResult struct {
 	err       error
 }
 
+type provisionState struct {
+	sessionID string
+	token     string
+	expiresAt time.Time
+}
+
 type connectionRun struct {
 	client             *Client
 	ctx                context.Context
@@ -44,6 +50,7 @@ type connectionRun struct {
 	generation         uint64
 	writes             chan writeRequest
 	provision          chan provisionResult
+	acceptedProvision  provisionState
 	logout             chan error
 	done               chan struct{}
 	closeOnce          sync.Once
@@ -130,6 +137,10 @@ func (c *Client) Login(ctx context.Context, userID, token string) error {
 		c.mu.Unlock()
 		return newError(ErrClientClosed, "login", "")
 	}
+	if c.terminalCallback != nil {
+		c.mu.Unlock()
+		return newError(ErrCallbackBacklog, "login", "terminal callback has not been dispatched")
+	}
 	if c.state != LoginStateLogout {
 		c.mu.Unlock()
 		return newError(ErrAlreadyLoggedIn, "login", "client is already active")
@@ -142,13 +153,14 @@ func (c *Client) Login(ctx context.Context, userID, token string) error {
 	c.tokenExpiresAt = time.Time{}
 	c.backoffAttempt.Store(0)
 	cb := c.callbacks.connection
+	connectingEpoch := c.callbackEpoch
 	c.mu.Unlock()
 	if cb != nil {
-		c.emit(func() { cb(userID, ConnStateConnecting) })
+		c.emitAt(connectingEpoch, func() { cb(userID, ConnStateConnecting) })
 	}
 	connectCtx, cancel := context.WithTimeout(ctx, connectTimeout)
 	defer cancel()
-	stopLifecycleCancel := context.AfterFunc(c.eventCtx, cancel)
+	stopLifecycleCancel := context.AfterFunc(c.lifetimeCtx, cancel)
 	defer stopLifecycleCancel()
 	resolved, err := c.resolveCachedEndpointCandidates(connectCtx, 0)
 	if err != nil {
@@ -166,6 +178,8 @@ func (c *Client) Login(ctx context.Context, userID, token string) error {
 		r.shutdown(newError(ErrClientClosed, "login", "closed while connecting"))
 		return newError(ErrClientClosed, "login", "")
 	}
+	c.applyProvisionLocked(r.acceptedProvision)
+	sessionCtx, sessionGeneration := c.startSessionLocked()
 	c.run = r
 	c.state = LoginStateLoggedIn
 	c.connState = ConnStateConnected
@@ -175,9 +189,12 @@ func (c *Client) Login(ctx context.Context, userID, token string) error {
 	c.dnsGeneration = resolved.Generation
 	c.restBase = resolved.Endpoints.REST
 	c.lastStableConnect.Store(time.Now().UnixNano())
+	expiresAt := c.tokenExpiresAt
+	connectedEpoch := c.callbackEpoch
 	c.mu.Unlock()
+	c.scheduleTokenExpiryWarning(sessionCtx, sessionGeneration, expiresAt)
 	if cb != nil {
-		c.emit(func() { cb(userID, ConnStateConnected) })
+		c.emitAt(connectedEpoch, func() { cb(userID, ConnStateConnected) })
 	}
 	go c.monitor(r)
 	return nil
@@ -244,7 +261,7 @@ func (c *Client) connectWithRedirects(ctx context.Context, endpoint string) (*co
 		}
 		p, err := r.login(ctx)
 		if err == nil {
-			c.acceptProvision(p)
+			r.acceptedProvision = parseProvisionState(p)
 			if err := r.sendUnread(); err != nil {
 				r.shutdown(err)
 				return nil, err
@@ -554,21 +571,48 @@ func (r *connectionRun) tryProvision(p *internalprotocol.Provision, err error) {
 	}
 }
 
-func (c *Client) acceptProvision(p *internalprotocol.Provision) {
-	c.mu.Lock()
-	c.sessionID = p.SessionID
-	c.mu.Unlock()
+func parseProvisionState(p *internalprotocol.Provision) provisionState {
+	if p == nil {
+		return provisionState{}
+	}
+	state := provisionState{sessionID: p.SessionID}
 	if len(p.AuthToken) > 0 {
 		var v struct {
 			Token     string `json:"token"`
 			ExpiresIn int64  `json:"expires_in"`
 		}
 		if json.Unmarshal(p.AuthToken, &v) == nil && v.Token != "" {
-			expiresAt := tokenExpiryTime(v.ExpiresIn, time.Now())
-			c.updateProvisionToken(v.Token, expiresAt)
-			c.scheduleTokenExpiryWarning(expiresAt)
+			state.token = v.Token
+			state.expiresAt = tokenExpiryTime(v.ExpiresIn, time.Now())
 		}
 	}
+	return state
+}
+
+func (c *Client) applyProvisionLocked(state provisionState) {
+	c.sessionID = state.sessionID
+	if state.token == "" {
+		return
+	}
+	if c.tokenWarningCancel != nil {
+		c.tokenWarningCancel()
+		c.tokenWarningCancel = nil
+	}
+	c.token = state.token
+	c.tokenExpiresAt = state.expiresAt
+}
+
+// acceptProvision is retained as a focused state-transition helper for tests;
+// live connection attempts stage provision data on connectionRun and apply it
+// only after the run wins the session/generation commit check.
+func (c *Client) acceptProvision(p *internalprotocol.Provision) {
+	state := parseProvisionState(p)
+	c.mu.Lock()
+	c.applyProvisionLocked(state)
+	sessionCtx := c.sessionCtx
+	sessionGeneration := c.sessionGeneration
+	c.mu.Unlock()
+	c.scheduleTokenExpiryWarning(sessionCtx, sessionGeneration, state.expiresAt)
 }
 
 // expires_in is historically named but C++ treats it as an expiry timestamp.
@@ -586,25 +630,19 @@ func tokenExpiryTime(value int64, now time.Time) time.Time {
 	}
 }
 
-func (c *Client) updateProvisionToken(token string, expiresAt time.Time) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.tokenWarningCancel != nil {
-		c.tokenWarningCancel()
-		c.tokenWarningCancel = nil
-	}
-	c.token = token
-	c.tokenExpiresAt = expiresAt
-}
-
-func (c *Client) scheduleTokenExpiryWarning(expiresAt time.Time) {
+func (c *Client) scheduleTokenExpiryWarning(sessionCtx context.Context, sessionGeneration uint64, expiresAt time.Time) {
 	cb := c.callbackSnapshot().tokenWillExpire
-	if expiresAt.IsZero() || cb == nil {
+	if sessionCtx == nil || expiresAt.IsZero() || cb == nil {
 		return
 	}
 	userID := c.currentUserID()
-	ctx, cancel := context.WithCancel(c.eventCtx)
+	ctx, cancel := context.WithCancel(sessionCtx)
 	c.mu.Lock()
+	if !c.sessionIsCurrentLocked(sessionGeneration) {
+		c.mu.Unlock()
+		cancel()
+		return
+	}
 	if c.tokenWarningCancel != nil {
 		c.tokenWarningCancel()
 	}
@@ -616,7 +654,14 @@ func (c *Client) scheduleTokenExpiryWarning(expiresAt time.Time) {
 		defer timer.Stop()
 		select {
 		case <-timer.C:
-			c.emit(func() { cb(userID, expiresAt) })
+			c.emit(func() {
+				c.mu.RLock()
+				current := c.sessionIsCurrentLocked(sessionGeneration) && c.tokenExpiresAt.Equal(expiresAt)
+				c.mu.RUnlock()
+				if current {
+					cb(userID, expiresAt)
+				}
+			})
 		case <-ctx.Done():
 		}
 	}()
@@ -701,10 +746,12 @@ func (c *Client) monitor(r *connectionRun) {
 
 func (c *Client) reconnect(old *connectionRun) {
 	c.mu.Lock()
-	if c.closed || c.run != old || c.state == LoginStateLogout {
+	if c.closed || c.run != old || c.state == LoginStateLogout || c.sessionCtx == nil {
 		c.mu.Unlock()
 		return
 	}
+	sessionCtx := c.sessionCtx
+	sessionGeneration := c.sessionGeneration
 	changed := c.connState != ConnStateReconnecting
 	c.state = LoginStateReconnecting
 	c.connState = ConnStateReconnecting
@@ -716,12 +763,13 @@ func (c *Client) reconnect(old *connectionRun) {
 	dnsGeneration := c.dnsGeneration
 	lastErr := c.lastErr
 	delayFn := c.reconnectDelayFn
+	reconnectingEpoch := c.callbackEpoch
 	c.mu.Unlock()
 	if delayFn == nil {
 		delayFn = reconnectDelay
 	}
 	if changed && stateCallback != nil {
-		c.emit(func() { stateCallback(userID, ConnStateReconnecting) })
+		c.emitAt(reconnectingEpoch, func() { stateCallback(userID, ConnStateReconnecting) })
 	}
 
 	round := newEndpointRound(hosts, cursor)
@@ -733,7 +781,7 @@ func (c *Client) reconnect(old *connectionRun) {
 		if next, err := redirectURL(old.endpoint, redirect.info); err == nil {
 			endpoint = next
 		} else {
-			c.recordTerminalForRun(old, err)
+			c.recordTerminalForSession(old, sessionGeneration, err)
 			return
 		}
 	} else if shouldRotateEndpoint(lastErr) {
@@ -750,7 +798,7 @@ func (c *Client) reconnect(old *connectionRun) {
 		c.backoffAttempt.Store(uint32(attempt))
 		c.mu.RLock()
 		closed := c.closed
-		current := c.run == old && c.state == LoginStateReconnecting
+		current := c.run == old && c.state == LoginStateReconnecting && c.sessionIsCurrentLocked(sessionGeneration)
 		c.mu.RUnlock()
 		if closed || !current {
 			return
@@ -758,7 +806,7 @@ func (c *Client) reconnect(old *connectionRun) {
 		timer := time.NewTimer(delayFn(attempt))
 		select {
 		case <-timer.C:
-		case <-c.eventCtx.Done():
+		case <-sessionCtx.Done():
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
@@ -768,13 +816,13 @@ func (c *Client) reconnect(old *connectionRun) {
 			return
 		}
 		c.mu.RLock()
-		current = c.run == old && c.state == LoginStateReconnecting
+		current = c.run == old && c.state == LoginStateReconnecting && c.sessionIsCurrentLocked(sessionGeneration)
 		c.mu.RUnlock()
 		if c.isClosed() || !current {
 			return
 		}
 		stop := func() bool {
-			connectDone, err := c.beginConnect(c.eventCtx, "reconnect")
+			connectDone, err := c.beginConnect(sessionCtx, "reconnect")
 			if err != nil {
 				return true
 			}
@@ -783,21 +831,24 @@ func (c *Client) reconnect(old *connectionRun) {
 			// Logout. Revalidate after acquiring lifecycle ownership.
 			c.mu.RLock()
 			closed = c.closed
-			current = c.run == old && c.state == LoginStateReconnecting
+			current = c.run == old && c.state == LoginStateReconnecting && c.sessionIsCurrentLocked(sessionGeneration)
 			c.mu.RUnlock()
 			if closed || !current {
 				return true
 			}
-			ctx, cancel := context.WithTimeout(c.eventCtx, connectTimeout)
+			ctx, cancel := context.WithTimeout(sessionCtx, connectTimeout)
 			defer cancel()
 			if needRefresh {
 				resolved, err := c.resolveCachedEndpointCandidates(ctx, dnsGeneration)
 				if err != nil {
+					if sessionCtx.Err() != nil {
+						return true
+					}
 					c.mu.Lock()
 					c.lastErr = err
 					c.mu.Unlock()
 					if isTerminal(err) {
-						c.recordTerminalForRun(old, err)
+						c.recordTerminalForSession(old, sessionGeneration, err)
 						return true
 					}
 					return false
@@ -824,6 +875,9 @@ func (c *Client) reconnect(old *connectionRun) {
 
 			r, err := c.connectEndpoint(ctx, endpoint)
 			if err != nil {
+				if sessionCtx.Err() != nil {
+					return true
+				}
 				if c.isClosed() {
 					return true
 				}
@@ -831,7 +885,7 @@ func (c *Client) reconnect(old *connectionRun) {
 				c.lastErr = err
 				c.mu.Unlock()
 				if isTerminal(err) {
-					c.recordTerminalForRun(old, err)
+					c.recordTerminalForSession(old, sessionGeneration, err)
 					return true
 				}
 				if c.debug {
@@ -849,11 +903,13 @@ func (c *Client) reconnect(old *connectionRun) {
 				return false
 			}
 			c.mu.Lock()
-			if c.closed || c.run != old {
+			if c.closed || c.run != old || c.state != LoginStateReconnecting ||
+				!c.sessionIsCurrentLocked(sessionGeneration) || sessionCtx.Err() != nil {
 				c.mu.Unlock()
 				r.shutdown(newError(ErrClientClosed, "reconnect", "superseded"))
 				return true
 			}
+			c.applyProvisionLocked(r.acceptedProvision)
 			c.run = r
 			c.state = LoginStateLoggedIn
 			c.connState = ConnStateConnected
@@ -865,9 +921,12 @@ func (c *Client) reconnect(old *connectionRun) {
 			c.msyncCursor = cursor
 			c.dnsGeneration = dnsGeneration
 			c.lastStableConnect.Store(time.Now().UnixNano())
+			expiresAt := c.tokenExpiresAt
+			connectedEpoch := c.callbackEpoch
 			c.mu.Unlock()
+			c.scheduleTokenExpiryWarning(sessionCtx, sessionGeneration, expiresAt)
 			if cb := c.callbackSnapshot().connection; cb != nil {
-				c.emit(func() { cb(userID, ConnStateConnected) })
+				c.emitAt(connectedEpoch, func() { cb(userID, ConnStateConnected) })
 			}
 			go c.monitor(r)
 			return true
@@ -906,8 +965,17 @@ func (c *Client) recordTerminal(err error) {
 }
 
 func (c *Client) recordTerminalForRun(expected *connectionRun, err error) {
+	c.recordTerminalForRunSession(expected, 0, false, err)
+}
+
+func (c *Client) recordTerminalForSession(expected *connectionRun, sessionGeneration uint64, err error) {
+	c.recordTerminalForRunSession(expected, sessionGeneration, true, err)
+}
+
+func (c *Client) recordTerminalForRunSession(expected *connectionRun, sessionGeneration uint64, requireSession bool, err error) {
 	c.mu.Lock()
-	if expected != nil && c.run != expected {
+	if c.closed || (expected != nil && c.run != expected) ||
+		(requireSession && !c.sessionIsCurrentLocked(sessionGeneration)) {
 		c.mu.Unlock()
 		return
 	}
@@ -925,27 +993,16 @@ func (c *Client) recordTerminalForRun(expected *connectionRun, err error) {
 	c.dnsGeneration = 0
 	c.restBase = ""
 	c.tokenExpiresAt = time.Time{}
+	c.cancelSessionLocked()
 	if c.tokenWarningCancel != nil {
 		c.tokenWarningCancel()
 		c.tokenWarningCancel = nil
 	}
-	cb := c.callbacks.disconnect
+	c.callbackEpoch++
+	published := c.publishTerminalCallbackLocked(userID, err, c.callbacks)
 	c.mu.Unlock()
-	c.fireErrorCallback(userID, err)
-	if cb != nil {
-		c.emit(func() { cb(userID, err) })
-	}
-	if state := c.callbackSnapshot().connection; state != nil {
-		c.emit(func() { state(userID, ConnStateDisconnected) })
-	}
-}
-func (c *Client) fireErrorCallback(userID string, err error) {
-	callbacks := c.callbackSnapshot()
-	switch errorCode(err) {
-	case ErrTokenExpired:
-		if callbacks.tokenExpired != nil {
-			c.emit(func() { callbacks.tokenExpired(userID) })
-		}
+	if published {
+		c.signalTerminalCallback()
 	}
 }
 
@@ -959,11 +1016,17 @@ func (c *Client) fireErrorCallback(userID string, err error) {
 // pass a context with a deadline. In particular, Close(context.Background()) can
 // wait forever when a custom HTTP transport ignores Request.Context and never
 // returns.
+//
+// Close does not wait for application callbacks to become quiescent. A callback
+// already executing, or already accepted by the bounded event queue, may finish
+// after Close returns. Callbacks may call Close synchronously; waiting for the
+// dispatcher here would deadlock that supported pattern.
 func (c *Client) Close(ctx context.Context) error {
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
 		c.closed = true
-		c.eventCancel()
+		c.lifetimeCancel()
+		c.cancelSessionLocked()
 		if c.tokenWarningCancel != nil {
 			c.tokenWarningCancel()
 			c.tokenWarningCancel = nil
@@ -1009,8 +1072,8 @@ func (c *Client) finalizeClose(r *connectionRun) {
 	if closer, ok := c.codec.(interface{ Close() }); ok {
 		closer.Close()
 	}
-	// Do not wait for eventWG here: a callback is allowed to call Close, and
-	// waiting from the dispatcher goroutine would deadlock on itself.
+	// Do not wait for callbacks here: a callback is allowed to call Close, and
+	// waiting for the dispatcher would deadlock that callback on closeDone.
 	close(c.closeDone)
 }
 
@@ -1029,11 +1092,99 @@ func (c *Client) drainBatchJobs() {
 	}
 }
 
-// Logout ends the current session while keeping the Client reusable. Waiting
-// for another lifecycle operation is governed by ctx; if that wait times out,
-// Logout returns ctx.Err without clearing the current login state.
+// detachCanceledSessionForLogout prevents a canceled reconnect from leaving the
+// Client permanently stuck in Reconnecting when its network implementation
+// ignores cancellation past the caller's Logout deadline. The reconnect still
+// owns connectDone and will dispose of any late connection before releasing it.
+func (c *Client) detachCanceledSessionForLogout(sessionGeneration uint64) {
+	c.mu.Lock()
+	if sessionGeneration == 0 || c.sessionGeneration != sessionGeneration ||
+		c.sessionCtx != nil || c.state != LoginStateReconnecting {
+		c.mu.Unlock()
+		return
+	}
+	changed := c.connState != ConnStateDisconnected
+	userID := c.userID
+	c.run = nil
+	c.state = LoginStateLogout
+	c.connState = ConnStateDisconnected
+	c.sessionID = ""
+	c.userID = ""
+	c.token = ""
+	c.msyncHost = ""
+	c.msyncHosts = nil
+	c.msyncCursor = 0
+	c.dnsGeneration = 0
+	c.restBase = ""
+	c.tokenExpiresAt = time.Time{}
+	if c.tokenWarningCancel != nil {
+		c.tokenWarningCancel()
+		c.tokenWarningCancel = nil
+	}
+	c.callbackEpoch++
+	disconnectedEpoch := c.callbackEpoch
+	stateCallback := c.callbacks.connection
+	c.mu.Unlock()
+	if changed && stateCallback != nil {
+		c.emitAt(disconnectedEpoch, func() { stateCallback(userID, ConnStateDisconnected) })
+	}
+}
+
+// beginLogout cancels a reconnect session before waiting for lifecycle
+// ownership. Other active sessions remain untouched while another operation
+// owns the lifecycle; once ownership is immediately available, Logout cancels
+// any current session before claiming it.
+func (c *Client) beginLogout(ctx context.Context) (chan struct{}, error) {
+	var canceledSession bool
+	var canceledGeneration uint64
+	for {
+		if err := ctx.Err(); err != nil {
+			if canceledSession {
+				c.detachCanceledSessionForLogout(canceledGeneration)
+			}
+			return nil, err
+		}
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return nil, newError(ErrClientClosed, "logout", "")
+		}
+		if c.connectDone == nil {
+			if c.sessionCtx != nil {
+				c.cancelSessionLocked()
+			}
+			done := make(chan struct{})
+			c.connectDone = done
+			c.mu.Unlock()
+			return done, nil
+		}
+		if c.state == LoginStateReconnecting && c.sessionCtx != nil {
+			canceledSession = true
+			canceledGeneration = c.sessionGeneration
+			c.cancelSessionLocked()
+		}
+		done := c.connectDone
+		c.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			if canceledSession {
+				c.detachCanceledSessionForLogout(canceledGeneration)
+			}
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// Logout ends the current session while keeping the Client reusable. It first
+// cancels any reconnect attempt so a context-respecting DNS lookup or dial does
+// not hold lifecycle ownership until connectTimeout. If a reconnect ignores
+// cancellation past ctx, Logout returns ctx.Err after detaching that canceled
+// session locally; the late reconnect result is rejected asynchronously. A
+// timeout waiting for an initial Login still preserves that Login state because
+// no established session has been canceled.
 func (c *Client) Logout(ctx context.Context) error {
-	connectDone, err := c.beginConnect(ctx, "logout")
+	connectDone, err := c.beginLogout(ctx)
 	if err != nil {
 		return err
 	}
@@ -1063,11 +1214,13 @@ func (c *Client) Logout(ctx context.Context) error {
 		c.tokenWarningCancel = nil
 	}
 	c.token = ""
+	c.callbackEpoch++
+	disconnectedEpoch := c.callbackEpoch
 	stateCallback := c.callbacks.connection
 	c.mu.Unlock()
 	if r == nil {
 		if wasConnected && stateCallback != nil {
-			c.emit(func() { stateCallback(userID, ConnStateDisconnected) })
+			c.emitAt(disconnectedEpoch, func() { stateCallback(userID, ConnStateDisconnected) })
 		}
 		return nil
 	}
@@ -1095,7 +1248,7 @@ func (c *Client) Logout(ctx context.Context) error {
 	}
 	r.shutdown(newError(ErrStreamClosed, "logout", "session ended"))
 	if wasConnected && stateCallback != nil {
-		c.emit(func() { stateCallback(userID, ConnStateDisconnected) })
+		c.emitAt(disconnectedEpoch, func() { stateCallback(userID, ConnStateDisconnected) })
 	}
 	return err
 }

@@ -66,9 +66,9 @@ func main() {
 ```
 
 `New` 只创建 SDK 实例，`Login(ctx, userID, token)` 才开始 DNS、WSS 和 Provision 登录。
-`Login` 只能在未登录状态调用；`Logout` 后可以使用同一 Client 再次登录。`Send` 要求已登录且连接正常，发送方始终是当前登录用户。SDK 版本由库内部维护，业务不配置 `MsyncHost`、`RestBase` 或 `SDKVersion`。
+`Login` 只能在未登录状态调用；`Logout` 后可以使用同一 Client 再次登录。重连期间调用 `Logout` 会先取消当前 DNS/拨号尝试，再取得生命周期所有权完成本地清理；若自定义网络实现忽略取消直到调用方 context 超时，SDK 仍会把已取消的重连会话从 Client 脱离，并在迟到的拨号返回时拒绝安装该连接。等待尚未完成的首次 `Login` 超时时则保持原有登录状态。若上一会话的终态回调尚未被 dispatcher 取走，`Login` 返回可重试的 `ErrCallbackBacklog`，避免在慢回调期间无界累积跨会话终态事件；dispatcher 在调用终态回调前会清除该状态，因此回调内重试登录不会等待自身。`Send` 要求已登录且连接正常，发送方始终是当前登录用户。SDK 版本由库内部维护，业务不配置 `MsyncHost`、`RestBase` 或 `SDKVersion`。
 
-`Close(ctx)` 首次调用时会立即把 Client 标记为永久关闭并取消当前连接，随后在后台等待正在进行的登录、重连或登出操作退出，再销毁共享 native codec。只有返回 `nil` 才表示这个共享收尾已完成；如果 ctx 先结束则返回 `ctx.Err()`，收尾仍会继续，后续 `Close` 会等待同一个结果。需要有界关闭时延时必须传入带 deadline 的 context。自定义 `HTTPClient.Transport` 必须遵守 `Request.Context`；Go 无法强制终止一个永不返回的 Transport，因此这种错误配置下 `Close(context.Background())` 也可能永久等待。SDK 不会通过另起 goroutine 假装已终止这类请求，因为那会掩盖泄漏并可能过早销毁 codec。
+`Close(ctx)` 首次调用时会立即把 Client 标记为永久关闭并取消当前连接，随后在后台等待正在进行的登录、重连或登出操作退出，再销毁共享 native codec。只有返回 `nil` 才表示这个共享收尾已完成；如果 ctx 先结束则返回 `ctx.Err()`，收尾仍会继续，后续 `Close` 会等待同一个结果。需要有界关闭时延时必须传入带 deadline 的 context。自定义 `HTTPClient.Transport` 必须遵守 `Request.Context`；Go 无法强制终止一个永不返回的 Transport，因此这种错误配置下 `Close(context.Background())` 也可能永久等待。SDK 不会通过另起 goroutine 假装已终止这类请求，因为那会掩盖泄漏并可能过早销毁 codec。`Close` 不等待业务回调完全静默：已经执行或已经进入有界事件队列的回调可能在 `Close` 返回后完成；回调内允许同步调用 `Close`，不会因此等待事件 dispatcher。
 
 SDK 固定请求 `https://rs.easemob.com/easemob/server.json`，并携带 `sdk_version`、`app_key` 和 `file_version=1`。返回的 `msync-wx.hosts` 会按 `priority=1` 优先且保持服务端顺序，最多保留 64 个去重后的安全 WSS 候选；登录和重连遇到 endpoint-local 网络错误时会轮换候选，一轮耗尽后重新获取 DNS。Provision redirect 成功后的最终地址会成为当前 effective endpoint。REST 仍只选择一个 `priority=1` HTTPS 地址，不做多地址切换。进程内相同 AppKey 和同一 `*http.Client` 共享 DNS 请求与 5 分钟 fresh cache；刷新暂时失败时，已验证结果最多 stale 使用 30 分钟。缺少有效地址、响应过大或 JSON 无效仍会直接失败。
 
@@ -225,7 +225,10 @@ MessageHandler: func(ctx context.Context, msg *imsdk.Message) error {
 ### 回调注意事项
 
 - 除 `MessageHandler` 外的回调都在同一事件分发协程执行，必须快速返回，不要在回调里做阻塞/耗时操作（需要则起独立 goroutine）。
-- 事件队列有界，慢回调会导致事件被丢弃（日志会告警），连接状态始终可通过 `Health()` 查询兜底。
+- `MessageHandler` 不经过事件回调队列；聊天消息仍由 batch worker、字节预算和断链重投保证，不会因下面的 callback overflow policy 被丢弃。
+- `OnConnectionStateChanged` 和 `OnTokenWillExpire` 是有界 best-effort 通知：慢回调导致队列满时允许丢弃/合并，`Health()` 与 `TokenExpiresAt()` 是权威查询兜底。累计丢弃数由 `Health().CallbackEventsDropped` 暴露，告警最多每分钟一次。
+- `OnTokenExpired`、`OnDisconnect` 和同一终态的 `Disconnected` 被合并为一个 O(1) sticky terminal event；即使普通事件队列已满也不会丢失。终态会覆盖尚未执行的旧连接状态，避免在 `Disconnected` 之后再回调旧的 `Connected/Reconnecting`；等待 dispatcher 取走期间可通过 `Health().TerminalCallbackPending` 观察。
+- `Close` 不等待业务回调完全静默；已经执行或已经进入事件队列的回调可能在 `Close` 返回后完成。回调内允许同步调用 `Close`。
 
 ## 集成验收 Demo
 

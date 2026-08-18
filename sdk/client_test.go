@@ -163,6 +163,10 @@ func TestProvisionTokenExpiryIsRecordedAndWarned(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close(context.Background())
+	c.mu.Lock()
+	c.userID = "token-user"
+	_, _ = c.startSessionLocked()
+	c.mu.Unlock()
 	expires := time.Now().Add(100 * time.Millisecond).UnixMilli()
 	payload := []byte(`{"token":"rotated","expires_in":` + fmt.Sprint(expires) + `}`)
 	c.acceptProvision(&internalprotocol.Provision{AuthToken: payload})
