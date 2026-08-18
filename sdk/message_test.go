@@ -102,7 +102,7 @@ func TestBuildOutgoingMetaValidation(t *testing.T) {
 		t.Fatal("expected directed non-group error")
 	}
 	if _, err := buildOutgoingMeta(codec, "a", "u", "d", "r", SendRequest{
-		To: "u", Body: MessageBody{Type: MessageBodyCommand, Params: map[string]KeyValue{
+		To: "u", Body: MessageBody{Type: MessageBodyCustom, CustomExts: map[string]KeyValue{
 			"n": {Type: KeyValueInt, Value: int64(1)},
 		}},
 	}); err == nil {
@@ -124,9 +124,7 @@ func TestBuildOutgoingMetaEncodesTypedMessageExtInStableOrder(t *testing.T) {
 			"b_int":    {Type: KeyValueInt, Value: int(-7)},
 			"g_string": {Type: KeyValueString, Value: "value"},
 		},
-		Body: MessageBody{Type: MessageBodyCommand, Action: "run", Params: map[string]KeyValue{
-			"body-only": {Type: KeyValueString, Value: "param"},
-		}},
+		Body: MessageBody{Type: MessageBodyText, Text: "hello"},
 	}
 	if _, err := buildOutgoingMeta(codec, "org#app", "alice", "easemob.com", "resource", req); err != nil {
 		t.Fatal(err)
@@ -149,9 +147,6 @@ func TestBuildOutgoingMetaEncodesTypedMessageExtInStableOrder(t *testing.T) {
 		got[6].Kind != internalprotocol.KeyValueString || got[6].String != "value" ||
 		got[7].Kind != internalprotocol.KeyValueJSONString || got[7].String != `{"order_id":"123"}` {
 		t.Fatalf("typed ext=%#v", got)
-	}
-	if got := codec.encoded.Contents[0].Params; len(got) != 1 || got[0].Key != "body-only" {
-		t.Fatalf("command params mixed with message ext: %#v", got)
 	}
 }
 
@@ -207,7 +202,7 @@ func TestParseIncomingMessagePreservesTypedKeyValues(t *testing.T) {
 	codec := &messageTestCodec{decoded: &internalprotocol.MessageBody{
 		Kind: internalprotocol.MessageGroupChat,
 		From: internalprotocol.JID{Name: "alice"}, To: internalprotocol.JID{Name: "group"}, Ext: values,
-		Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentCommand, Action: "run", Params: values}},
+		Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentCommand, Action: "run"}},
 	}}
 	got, err := parseIncomingMessage(codec, internalprotocol.Meta{ID: 99, Timestamp: 1234, Payload: []byte("payload")})
 	if err != nil {
@@ -223,8 +218,8 @@ func TestParseIncomingMessagePreservesTypedKeyValues(t *testing.T) {
 		got.Ext["double"].Value != 2.5 || got.Ext["string"].Value != "value" || got.Ext["json"].Value != `{"a":1}` {
 		t.Fatalf("typed ext=%#v", got.Ext)
 	}
-	if got.Bodies[0].Type != MessageBodyCommand || got.Bodies[0].Action != "run" {
-		t.Fatalf("body=%+v", got.Bodies[0])
+	if got.Body == nil || got.Body.Type != MessageBodyCommand || got.Body.Action != "run" {
+		t.Fatalf("body=%+v", got.Body)
 	}
 }
 
@@ -259,8 +254,8 @@ func TestUnknownBodyDoesNotFailMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Bodies) != 1 || got.Bodies[0].Type != MessageBodyUnknown || got.Bodies[0].RawType != 99 || len(got.Bodies[0].RawPayload) == 0 {
-		t.Fatalf("body=%+v", got.Bodies)
+	if got.Body == nil || got.Body.Type != MessageBodyUnknown || got.Body.RawType != 99 || len(got.Body.RawPayload) == 0 {
+		t.Fatalf("body=%+v", got.Body)
 	}
 }
 

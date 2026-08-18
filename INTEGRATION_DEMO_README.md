@@ -114,7 +114,7 @@ wss.meta
 message.received
 ```
 
-`message.received` 包含 `ext_count`。其 `message_json` 是脱敏视图：包含消息 ID、发送方、接收方、body 类型以及完整的消息级 `Ext`，不包含文本正文、CMD Params、CustomExts 或原始 payload。
+`message.received` 包含 `ext_count`。其 `message_json` 是脱敏视图：包含消息 ID、发送方、接收方、body 类型以及完整的消息级 `Ext`，不包含文本正文、CustomExts 或原始 payload。
 
 带 Ext 的消息示例：
 
@@ -148,7 +148,7 @@ message.received
 
 ### 单聊 CMD 消息
 
-`-send-params` 使用逗号分隔的 `key=value`：
+CMD 消息只携带 action（旧协议的 params 参数已废弃）：
 
 ```bash
 ./bin/integration-demo \
@@ -157,7 +157,6 @@ message.received
   -send-to peer-user \
   -send-type command \
   -send-action "run-job" \
-  -send-params "job_id=123,priority=high" \
   2>&1 | tee send-cmd.log
 ```
 
@@ -195,7 +194,6 @@ message.received
 三类扩展字段的边界：
 
 - `SendRequest.Ext` 是消息级扩展，接收端对应 `Message.Ext`。Go API 支持 `KeyValueBool`、`KeyValueInt`、`KeyValueUint`、`KeyValueLong`、`KeyValueFloat`、`KeyValueDouble`、`KeyValueString` 和 `KeyValueJSONString`，SDK 按 key 稳定排序编码。
-- `MessageBody.Params` 只是 CMD body 参数，发送时支持 `KeyValueString` 和 `KeyValueJSONString`。
 - `MessageBody.CustomExts` 只是 Custom body 扩展，发送时支持 `KeyValueString` 和 `KeyValueJSONString`。
 
 `nil` 或空 `SendRequest.Ext` 不会发送 ext，与旧的 wire 行为保持一致。
@@ -533,7 +531,7 @@ rest.request / rest.response / rest.error
 4. 目标端是否新增 `message.received`。
 5. 非目标成员的 `message.received` 是否没有增加。
 
-日志不会输出 Authorization 或 token。Demo 的 `message_json` 已脱敏，不输出文本正文、CMD Params、CustomExts 或原始 payload，但会保留本轮验收需要的消息级 Ext。Ext 也应视为业务数据，测试时不要放入 token、Authorization、个人信息或其他敏感值。
+日志不会输出 Authorization 或 token。Demo 的 `message_json` 已脱敏，不输出文本正文、CustomExts 或原始 payload，但会保留本轮验收需要的消息级 Ext。Ext 也应视为业务数据，测试时不要放入 token、Authorization、个人信息或其他敏感值。
 
 ## 七、离线消息边界
 

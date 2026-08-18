@@ -23,7 +23,7 @@ type Message struct {
 	// message. For a message sent by this SDK, it equals SendResult.MessageID.
 	MetaID    uint64              `json:"meta_id"`
 	Timestamp uint64              `json:"timestamp"`
-	Bodies    []*MessageBody      `json:"bodies"`
+	Body      *MessageBody        `json:"body"`
 	Ext       map[string]KeyValue `json:"ext,omitempty"`
 }
 
@@ -40,7 +40,6 @@ type MessageBody struct {
 	Type       MessageBodyType     `json:"type"`
 	Text       string              `json:"text,omitempty"`
 	Action     string              `json:"action,omitempty"`
-	Params     map[string]KeyValue `json:"params,omitempty"`
 	Event      string              `json:"event,omitempty"`
 	CustomExts map[string]KeyValue `json:"custom_exts,omitempty"`
 	RawType    int32               `json:"raw_type,omitempty"`
@@ -308,11 +307,8 @@ func encodeOutgoingContent(body MessageBody) (internalprotocol.Content, error) {
 	case MessageBodyText:
 		return internalprotocol.Content{Kind: internalprotocol.ContentText, Text: body.Text}, nil
 	case MessageBodyCommand:
-		params, err := encodeStringKeyValues(body.Params)
-		if err != nil {
-			return internalprotocol.Content{}, fmt.Errorf("command params: %w", err)
-		}
-		return internalprotocol.Content{Kind: internalprotocol.ContentCommand, Action: body.Action, Params: params}, nil
+		// 老协议中 cmd 消息的 params 参数已废弃，不再编码。
+		return internalprotocol.Content{Kind: internalprotocol.ContentCommand, Action: body.Action}, nil
 	case MessageBodyCustom:
 		exts, err := encodeStringKeyValues(body.CustomExts)
 		if err != nil {
@@ -349,22 +345,29 @@ func parseIncomingMessage(codec internalprotocol.Codec, meta internalprotocol.Me
 		return nil, fmt.Errorf("unmarshal message body: %w", err)
 	}
 	msg := &Message{From: wire.From.Name, To: wire.To.Name, IsGroup: wire.Kind == internalprotocol.MessageGroupChat, MetaID: meta.ID, Timestamp: meta.Timestamp, Ext: decodeKeyValues(wire.Ext)}
-	for _, content := range wire.Contents {
-		body := &MessageBody{}
-		switch content.Kind {
-		case internalprotocol.ContentText:
-			body.Type, body.Text = MessageBodyText, content.Text
-		case internalprotocol.ContentCommand:
-			body.Type, body.Action, body.Params = MessageBodyCommand, content.Action, decodeKeyValues(content.Params)
-		case internalprotocol.ContentCustom:
-			body.Type, body.Event, body.CustomExts = MessageBodyCustom, content.Event, decodeKeyValues(content.CustomExts)
-		default:
-			body.Type, body.RawType = MessageBodyUnknown, int32(content.Kind)
-			body.RawPayload = append([]byte(nil), content.RawPayload...)
-		}
-		msg.Bodies = append(msg.Bodies, body)
+	// 对外只暴露单个 body：当前单条消息只对应一个 body，其它端 SDK 也尚未实现
+	// 多 body。若 wire 上意外出现多个 content，只取第一个，其余丢弃。
+	if len(wire.Contents) > 0 {
+		msg.Body = decodeContent(wire.Contents[0])
 	}
 	return msg, nil
+}
+
+func decodeContent(content internalprotocol.Content) *MessageBody {
+	body := &MessageBody{}
+	switch content.Kind {
+	case internalprotocol.ContentText:
+		body.Type, body.Text = MessageBodyText, content.Text
+	case internalprotocol.ContentCommand:
+		// 老协议中 cmd 消息的 params 参数已废弃，不再对外暴露。
+		body.Type, body.Action = MessageBodyCommand, content.Action
+	case internalprotocol.ContentCustom:
+		body.Type, body.Event, body.CustomExts = MessageBodyCustom, content.Event, decodeKeyValues(content.CustomExts)
+	default:
+		body.Type, body.RawType = MessageBodyUnknown, int32(content.Kind)
+		body.RawPayload = append([]byte(nil), content.RawPayload...)
+	}
+	return body
 }
 
 func parseMessage(c *Client, meta internalprotocol.Meta) (*Message, error) {

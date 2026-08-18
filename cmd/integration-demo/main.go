@@ -27,7 +27,7 @@ func main() {
 	sendText := flag.String("send-text", "integration-demo test", "text body for -send-type=text")
 	sendAction := flag.String("send-action", "", "command action for -send-type=command")
 	sendEvent := flag.String("send-event", "", "custom event for -send-type=custom")
-	sendParams := flag.String("send-params", "", "comma-separated key=value pairs (command params / custom extensions)")
+	sendParams := flag.String("send-params", "", "comma-separated key=value pairs (custom extensions)")
 	sendExt := flag.String("send-ext", "", "comma-separated message extension key=value pairs")
 	sendGroup := flag.Bool("group", false, "send to a group instead of a single user")
 	directedUsers := flag.String("directed-users", "", "comma-separated user IDs for a directed group message")
@@ -64,16 +64,16 @@ func main() {
 		MessageHandler: func(_ context.Context, msg *imsdk.Message) error {
 			full, marshalErr := marshalSafeMessage(msg)
 			attrs := []any{"meta_id", msg.MetaID, "from", msg.From, "to", msg.To,
-				"is_group", msg.IsGroup, "body_count", len(msg.Bodies), "body_bytes", messageBodyBytes(msg),
+				"is_group", msg.IsGroup, "body_bytes", messageBodyBytes(msg),
 				"ext_count", len(msg.Ext)}
+			if msg.Body != nil {
+				attrs = append(attrs, "body_type", msg.Body.Type,
+					"body_text_bytes", len(msg.Body.Text),
+					"body_action", msg.Body.Action,
+					"body_event", msg.Body.Event)
+			}
 			if marshalErr == nil {
 				attrs = append(attrs, "message_json", string(full))
-			}
-			for i, body := range msg.Bodies {
-				attrs = append(attrs, fmt.Sprintf("body_%d_type", i), body.Type,
-					fmt.Sprintf("body_%d_text_bytes", i), len(body.Text),
-					fmt.Sprintf("body_%d_action", i), body.Action,
-					fmt.Sprintf("body_%d_event", i), body.Event)
 			}
 			logger.Info("message.received", attrs...)
 			return nil
@@ -225,11 +225,7 @@ func buildSendBody(bodyType, text, action, event, params string) (imsdk.MessageB
 	case "text":
 		return imsdk.MessageBody{Type: imsdk.MessageBodyText, Text: text}, nil
 	case "command":
-		kv, err := parseKeyValues(params)
-		if err != nil {
-			return imsdk.MessageBody{}, fmt.Errorf("command params: %w", err)
-		}
-		return imsdk.MessageBody{Type: imsdk.MessageBodyCommand, Action: action, Params: kv}, nil
+		return imsdk.MessageBody{Type: imsdk.MessageBodyCommand, Action: action}, nil
 	case "custom":
 		kv, err := parseKeyValues(params)
 		if err != nil {
@@ -280,25 +276,24 @@ func marshalSafeMessage(msg *imsdk.Message) ([]byte, error) {
 		IsGroup   bool                      `json:"is_group"`
 		MetaID    uint64                    `json:"meta_id"`
 		Timestamp uint64                    `json:"timestamp"`
-		Bodies    []safeBody                `json:"bodies"`
+		Body      *safeBody                 `json:"body,omitempty"`
 		Ext       map[string]imsdk.KeyValue `json:"ext,omitempty"`
 	}
 	view := safeMessage{
 		From: msg.From, To: msg.To, IsGroup: msg.IsGroup, MetaID: msg.MetaID,
 		Timestamp: msg.Timestamp, Ext: msg.Ext,
 	}
-	for _, body := range msg.Bodies {
-		view.Bodies = append(view.Bodies, safeBody{Type: body.Type, Action: body.Action, Event: body.Event})
+	if msg.Body != nil {
+		view.Body = &safeBody{Type: msg.Body.Type, Action: msg.Body.Action, Event: msg.Body.Event}
 	}
 	return json.Marshal(view)
 }
 
 func messageBodyBytes(msg *imsdk.Message) int {
-	n := 0
-	for _, body := range msg.Bodies {
-		n += len(body.Text) + len(body.Action) + len(body.Event) + len(body.RawPayload)
+	if msg.Body == nil {
+		return 0
 	}
-	return n
+	return len(msg.Body.Text) + len(msg.Body.Action) + len(msg.Body.Event) + len(msg.Body.RawPayload)
 }
 
 func splitCSV(value string) []string {

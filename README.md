@@ -227,7 +227,7 @@ MessageHandler: func(ctx context.Context, msg *imsdk.Message) error {
 
 ## 集成验收 Demo
 
-`cmd/integration-demo` 用于客户环境联调，覆盖 DNS 引导登录、连接状态、session ID、可选测试消息发送与 ACK、消息级 Ext、收到消息回调日志、token 生命周期和可选 REST 用户信息探测。`message_json` 是脱敏视图：保留消息元数据、body 类型和 Ext，不包含文本正文、CMD Params、CustomExts 或原始 payload。日志不输出 token 或 Authorization。
+`cmd/integration-demo` 用于客户环境联调，覆盖 DNS 引导登录、连接状态、session ID、可选测试消息发送与 ACK、消息级 Ext、收到消息回调日志、token 生命周期和可选 REST 用户信息探测。`message_json` 是脱敏视图：保留消息元数据、body 类型和 Ext，不包含文本正文、CustomExts 或原始 payload。日志不输出 token 或 Authorization。
 
 完整的中文命令行测试步骤见 [INTEGRATION_DEMO_README.md](INTEGRATION_DEMO_README.md)。
 
@@ -307,7 +307,7 @@ result, err := client.Send(ctx, imsdk.SendRequest{
 
 发送成功后，`result.MessageID` 是 ACK 返回的最终服务器消息 ID；`result.ClientMessageID` 只是本地关联和结果不确定重试使用的 ID。接收端同一条消息的 `Message.MetaID` 与 `result.MessageID` 一致。兼容字段 `result.ServerMessageID` 与 `MessageID` 值相同，新代码应使用 `MessageID`。
 
-发送端的 `SendRequest.Ext` 对应接收端的 `Message.Ext`，支持 `KeyValueBool`、`KeyValueInt`、`KeyValueUint`、`KeyValueLong`、`KeyValueFloat`、`KeyValueDouble`、`KeyValueString` 和 `KeyValueJSONString`。SDK 按 key 稳定排序编码；`nil` 或空 map 不会在 wire 上携带 Ext。`Body.Params` 仅属于 CMD body，`Body.CustomExts` 仅属于 Custom body，二者都不是消息级 Ext，发送时仍只支持 `KeyValueString` 和 `KeyValueJSONString`。
+发送端的 `SendRequest.Ext` 对应接收端的 `Message.Ext`，支持 `KeyValueBool`、`KeyValueInt`、`KeyValueUint`、`KeyValueLong`、`KeyValueFloat`、`KeyValueDouble`、`KeyValueString` 和 `KeyValueJSONString`。SDK 按 key 稳定排序编码；`nil` 或空 map 不会在 wire 上携带 Ext。`Body.CustomExts` 仅属于 Custom body，不是消息级 Ext，发送时仍只支持 `KeyValueString` 和 `KeyValueJSONString`。
 
 群聊设置 `IsGroup: true`；群定向消息同时填写 `DirectedUsers`。创建公开群、加入公开群、退出群，以及
 `UpdateOwnUserInfo`、`FetchUserInfo` 都使用本次 Login 的 DNS 结果、当前用户和 token。非 2xx 响应会返回

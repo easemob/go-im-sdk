@@ -234,21 +234,21 @@ func run() error {
 					"from", msg.From,
 					"to", msg.To,
 					"is_group", msg.IsGroup,
-					"body_count", len(msg.Bodies),
+					"body_type", msg.Body.Type,
 					"ext_count", len(msg.Ext))
 				return nil
 			}
 		},
-		OnConnectionStateChanged: func(state imsdk.ConnState) {
-			logger.Info("connection.state", "state", state.String())
+		OnConnectionStateChanged: func(userID string, state imsdk.ConnState) {
+			logger.Info("connection.state", "user_id", userID, "state", state.String())
 		},
-		OnDisconnect: func(err error) {
-			logger.Warn("connection.disconnected", "error", err)
+		OnDisconnect: func(userID string, err error) {
+			logger.Warn("connection.disconnected", "user_id", userID, "error", err)
 		},
-		OnTokenWillExpire: func(expiresAt time.Time) {
-			logger.Warn("token.will_expire", "expires_at", expiresAt)
+		OnTokenWillExpire: func(userID string, expiresAt time.Time) {
+			logger.Warn("token.will_expire", "user_id", userID, "expires_at", expiresAt)
 		},
-		OnTokenExpired:  func() { logger.Error("token.expired") },
+		OnTokenExpired:  func(userID string) { logger.Error("token.expired", "user_id", userID) },
 	})
 	if err != nil {
 		return fmt.Errorf("create IM client: %w", err)
@@ -318,7 +318,7 @@ type Message struct {
 	IsGroup   bool
 	MetaID    uint64
 	Timestamp uint64
-	Bodies    []*MessageBody
+	Body      *MessageBody
 	Ext       map[string]KeyValue
 }
 ```
@@ -331,16 +331,16 @@ func handleMessage(ctx context.Context, msg *imsdk.Message) error {
 		log.Printf("trace type=%s value=%v", trace.Type, trace.Value)
 	}
 
-	for _, body := range msg.Bodies {
-		switch body.Type {
+	if msg.Body != nil {
+		switch msg.Body.Type {
 		case imsdk.MessageBodyText:
-			log.Printf("text=%q", body.Text)
+			log.Printf("text=%q", msg.Body.Text)
 		case imsdk.MessageBodyCommand:
-			log.Printf("action=%q params=%v", body.Action, body.Params)
+			log.Printf("action=%q", msg.Body.Action)
 		case imsdk.MessageBodyCustom:
-			log.Printf("event=%q exts=%v", body.Event, body.CustomExts)
+			log.Printf("event=%q exts=%v", msg.Body.Event, msg.Body.CustomExts)
 		case imsdk.MessageBodyUnknown:
-			log.Printf("unknown raw_type=%d bytes=%d", body.RawType, len(body.RawPayload))
+			log.Printf("unknown raw_type=%d bytes=%d", msg.Body.RawType, len(msg.Body.RawPayload))
 		}
 	}
 	return persistIdempotently(ctx, msg.MetaID, msg)
@@ -492,12 +492,11 @@ Ext 编码规则：
 - `KeyValueJSONString.Value` 是承载 JSON 文本的 Go `string`；需要业务自行保证内容语义；
 - 类型和值不匹配会在发送前返回参数错误。
 
-三个扩展位置不能混用：
+两个扩展位置不能混用：
 
 | 字段 | 协议位置 | 用途 | 发送类型 |
 | --- | --- | --- | --- |
 | `SendRequest.Ext` | 整条消息的 `MessageBody.ext` | trace、业务上下文、跨消息类型元数据 | bool/int/uint/long/float/double/string/json_string |
-| `MessageBody.Params` | CMD content 参数 | 命令 action 的参数 | string/json_string |
 | `MessageBody.CustomExts` | Custom content 扩展 | Custom event 自身的数据 | string/json_string |
 
 ### 群组定向 Text、CMD 和 Custom
@@ -531,10 +530,6 @@ _, err := client.Send(ctx, imsdk.SendRequest{
 	Body: imsdk.MessageBody{
 		Type:   imsdk.MessageBodyCommand,
 		Action: "refresh-cache",
-		Params: map[string]imsdk.KeyValue{
-			"job_id":  {Type: imsdk.KeyValueString, Value: "123"},
-			"payload": {Type: imsdk.KeyValueJSONString, Value: `{"scope":"user"}`},
-		},
 	},
 })
 ```
@@ -885,7 +880,7 @@ if err := client.Close(context.Background()); err != nil {
 - handler、listener、日志和 telemetry 不执行无界阻塞操作；
 - 已处理 DNS、token 将过期/已过期；用户禁用/移除/踢出/其他设备登录通过 `OnDisconnect` 统一处理，并明确 SDK 没有独立的被踢回调；
 - 只在成功 `Login` 且 `Connected()` 为 true 时发送；
-- 消息级 `Ext`、CMD `Params` 和 Custom `CustomExts` 没有混用；
+- 消息级 `Ext` 和 Custom `CustomExts` 没有混用；
 - 发送结果不确定时复用原 `ClientMessageID`，不会盲目生成新 ID 重发；
 - 群组定向消息使用真实群 ID 和群成员的 IM 用户 ID；
 - 已将 `Client.Health()` 接入 readiness/监控，通常只有 `Connected()` 为 true 才报告 ready；

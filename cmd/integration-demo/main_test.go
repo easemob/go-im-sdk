@@ -52,8 +52,8 @@ func TestParseKeyValuesForMessageExt(t *testing.T) {
 func TestMarshalSafeMessageIncludesExtButOmitsTextAndRawPayload(t *testing.T) {
 	data, err := marshalSafeMessage(&imsdk.Message{
 		From: "alice", To: "bob", MetaID: 7,
-		Ext:    map[string]imsdk.KeyValue{"trace_id": {Type: imsdk.KeyValueString, Value: "demo-123"}},
-		Bodies: []*imsdk.MessageBody{{Type: imsdk.MessageBodyText, Text: "sensitive text", RawPayload: []byte("sensitive raw")}},
+		Ext:  map[string]imsdk.KeyValue{"trace_id": {Type: imsdk.KeyValueString, Value: "demo-123"}},
+		Body: &imsdk.MessageBody{Type: imsdk.MessageBodyText, Text: "sensitive text", RawPayload: []byte("sensitive raw")},
 	})
 	if err != nil {
 		t.Fatal(err)
