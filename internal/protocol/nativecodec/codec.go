@@ -9,6 +9,7 @@ package nativecodec
 #cgo linux,arm64 LDFLAGS: ${SRCDIR}/../../../native/lib/linux-arm64-glibc/libem_msync_codec.a -lstdc++ -pthread
 #cgo linux,amd64 LDFLAGS: ${SRCDIR}/../../../native/lib/linux-amd64-glibc/libem_msync_codec.a -lstdc++ -pthread
 #include <stdlib.h>
+#include <string.h>
 #include "em_msync_codec.h"
 */
 import "C"
@@ -27,6 +28,7 @@ type Codec struct {
 }
 
 var _ protocol.Codec = (*Codec)(nil)
+var _ protocol.DecodeAdmissionEstimator = (*Codec)(nil)
 
 func New() (*Codec, error) {
 	var code C.EMCodecError
@@ -48,6 +50,9 @@ func (c *Codec) Close() {
 func codecError(v C.EMCodecError) error {
 	if v == C.EM_CODEC_OK {
 		return nil
+	}
+	if v == C.EM_CODEC_LIMIT_EXCEEDED {
+		return fmt.Errorf("%w: native codec error %d", protocol.ErrLimitExceeded, int(v))
 	}
 	return fmt.Errorf("native codec error %d", int(v))
 }
@@ -72,8 +77,11 @@ func takeBuffer(out *C.EMCodecBuffer) ([]byte, error) {
 	if out.size == 0 {
 		return nil, nil
 	}
-	if uint64(out.size) > uint64(^uint32(0)>>1) {
-		return nil, fmt.Errorf("native codec output too large: %d", uint64(out.size))
+	if uint64(out.size) > protocol.MaxCodecInputBytes {
+		return nil, fmt.Errorf("%w: native codec output exceeds %d bytes", protocol.ErrLimitExceeded, protocol.MaxCodecInputBytes)
+	}
+	if out.data == nil {
+		return nil, fmt.Errorf("native codec returned nil output with size %d", uint64(out.size))
 	}
 	return C.GoBytes(unsafe.Pointer(out.data), C.int(out.size)), nil
 }
@@ -96,14 +104,94 @@ func makeJID(j protocol.JID) cJID {
 	v := C.EMCodecJID{struct_size: C.uint32_t(C.sizeof_EMCodecJID), app_key: a, name: n, domain: d, resource: r}
 	return cJID{v: v, free: func() { fa(); fn(); fd(); fr() }}
 }
-func goString(p *C.char) string {
+
+type decodeTracker struct {
+	stringBytes   uint64
+	payloadBytes  uint64
+	directedUsers uint64
+}
+
+func (t *decodeTracker) readString(p *C.char) (string, error) {
+	return t.readStringPointer(unsafe.Pointer(p))
+}
+
+func (t *decodeTracker) readStringPointer(p unsafe.Pointer) (string, error) {
 	if p == nil {
+		return "", nil
+	}
+	if t.stringBytes > protocol.MaxSyncStringBytes {
+		return "", fmt.Errorf("%w: decoded string bytes exceed %d", protocol.ErrLimitExceeded, protocol.MaxSyncStringBytes)
+	}
+	remaining := uint64(protocol.MaxSyncStringBytes) - t.stringBytes
+	length := uint64(C.strnlen((*C.char)(p), C.size_t(remaining+1)))
+	if length > remaining {
+		return "", fmt.Errorf("%w: decoded string bytes exceed %d", protocol.ErrLimitExceeded, protocol.MaxSyncStringBytes)
+	}
+	t.stringBytes += length
+	return copyCStringPointer(p, length), nil
+}
+
+func (t *decodeTracker) reserveStringBytes(size uint64) error {
+	if t.stringBytes > protocol.MaxSyncStringBytes || size > uint64(protocol.MaxSyncStringBytes)-t.stringBytes {
+		return fmt.Errorf("%w: decoded string bytes exceed %d", protocol.ErrLimitExceeded, protocol.MaxSyncStringBytes)
+	}
+	t.stringBytes += size
+	return nil
+}
+
+func (t *decodeTracker) addPayload(size uint64) error {
+	if t.payloadBytes > protocol.MaxSyncPayloadBytes || size > uint64(protocol.MaxSyncPayloadBytes)-t.payloadBytes {
+		return fmt.Errorf("%w: sync payload bytes exceed %d", protocol.ErrLimitExceeded, protocol.MaxSyncPayloadBytes)
+	}
+	t.payloadBytes += size
+	return nil
+}
+
+func (t *decodeTracker) addDirectedUsers(count uint64) error {
+	if t.directedUsers > protocol.MaxSyncDirectedUsers || count > uint64(protocol.MaxSyncDirectedUsers)-t.directedUsers {
+		return fmt.Errorf("%w: sync directed users exceed %d", protocol.ErrLimitExceeded, protocol.MaxSyncDirectedUsers)
+	}
+	t.directedUsers += count
+	return nil
+}
+
+func readJID(v C.EMCodecJID, tracker *decodeTracker) (protocol.JID, error) {
+	pointers := [...]unsafe.Pointer{unsafe.Pointer(v.app_key), unsafe.Pointer(v.name), unsafe.Pointer(v.domain), unsafe.Pointer(v.resource)}
+	return readJIDPointers(pointers, tracker)
+}
+
+func readJIDPointers(pointers [4]unsafe.Pointer, tracker *decodeTracker) (protocol.JID, error) {
+	var lengths [len(pointers)]uint64
+	var total uint64
+	for i, p := range pointers {
+		if p == nil {
+			continue
+		}
+		lengths[i] = uint64(C.strnlen((*C.char)(p), C.size_t(protocol.MaxJIDComponentBytes+1)))
+		if lengths[i] > protocol.MaxJIDComponentBytes {
+			return protocol.JID{}, fmt.Errorf("%w: JID component exceeds %d bytes", protocol.ErrLimitExceeded, protocol.MaxJIDComponentBytes)
+		}
+		if total > uint64(protocol.MaxJIDBytes)-lengths[i] {
+			return protocol.JID{}, fmt.Errorf("%w: JID exceeds %d bytes", protocol.ErrLimitExceeded, protocol.MaxJIDBytes)
+		}
+		total += lengths[i]
+	}
+	if err := tracker.reserveStringBytes(total); err != nil {
+		return protocol.JID{}, err
+	}
+	return protocol.JID{
+		AppKey:         copyCStringPointer(pointers[0], lengths[0]),
+		Name:           copyCStringPointer(pointers[1], lengths[1]),
+		Domain:         copyCStringPointer(pointers[2], lengths[2]),
+		ClientResource: copyCStringPointer(pointers[3], lengths[3]),
+	}, nil
+}
+
+func copyCStringPointer(p unsafe.Pointer, length uint64) string {
+	if p == nil || length == 0 {
 		return ""
 	}
-	return C.GoString(p)
-}
-func goJID(v C.EMCodecJID) protocol.JID {
-	return protocol.JID{AppKey: goString(v.app_key), Name: goString(v.name), Domain: goString(v.domain), ClientResource: goString(v.resource)}
+	return C.GoStringN((*C.char)(p), C.int(length))
 }
 
 func (c *Codec) EncodeProvision(v protocol.ProvisionRequest) ([]byte, error) {
@@ -355,25 +443,53 @@ func (c *Codec) DecodeFrame(data []byte) (*protocol.Frame, error) {
 		return nil, codecError(e)
 	}
 	defer C.em_codec_frame_free(f)
-	return decodeFrame(f), nil
+	return decodeFrame(f)
 }
 
-func decodeFrame(f *C.EMCodecFrame) *protocol.Frame {
+func (c *Codec) EstimateDecodeAdmission(data []byte) (protocol.DecodeAdmissionClass, error) {
+	return estimateDecodeAdmission(data)
+}
+
+func nativeCodecMaxInputBytes() uint64 {
+	return uint64(C.EM_CODEC_MAX_INPUT_BYTES)
+}
+
+func decodeFrame(f *C.EMCodecFrame) (*protocol.Frame, error) {
 	out := &protocol.Frame{Command: protocol.Command(C.em_codec_frame_command(f)), TraceID: uint64(C.em_codec_frame_trace_id(f))}
-	st := readStatus(f)
-	switch C.em_codec_frame_kind(f) {
+	kind := C.em_codec_frame_kind(f)
+	tracker := &decodeTracker{}
+	st, err := readStatus(f, tracker)
+	if err != nil {
+		return nil, err
+	}
+	switch kind {
 	case C.EM_CODEC_FRAME_PROVISION:
-		out.Provision = &protocol.Provision{Status: st, SessionID: goString(C.em_codec_frame_session_id(f)), AuthToken: readBytes(C.em_codec_frame_auth_token(f, nil), 0)}
+		sessionID, err := tracker.readString(C.em_codec_frame_session_id(f))
+		if err != nil {
+			return nil, err
+		}
 		var n C.size_t
 		p := C.em_codec_frame_auth_token(f, &n)
-		out.Provision.AuthToken = readBytes(p, n)
+		authToken, err := readBytes(unsafe.Pointer(p), uint64(n))
+		if err != nil {
+			return nil, err
+		}
+		out.Provision = &protocol.Provision{Status: st, SessionID: sessionID, AuthToken: authToken}
 	case C.EM_CODEC_FRAME_UNREAD:
-		u := &protocol.Unread{Status: st, Timestamp: uint64(C.em_codec_frame_timestamp(f))}
-		for i := C.size_t(0); i < C.em_codec_frame_unread_queue_count(f); i++ {
+		queueCount := uint64(C.em_codec_frame_unread_queue_count(f))
+		if queueCount > protocol.MaxFrameCollectionItems {
+			return nil, fmt.Errorf("%w: unread queue count exceeds %d", protocol.ErrLimitExceeded, protocol.MaxFrameCollectionItems)
+		}
+		u := &protocol.Unread{Status: st, Timestamp: uint64(C.em_codec_frame_timestamp(f)), Queues: make([]protocol.JID, 0, int(queueCount))}
+		for i := C.size_t(0); i < C.size_t(queueCount); i++ {
 			var j C.EMCodecJID
 			j.struct_size = C.uint32_t(C.sizeof_EMCodecJID)
 			if C.em_codec_frame_unread_queue(f, i, &j, nil) != 0 {
-				u.Queues = append(u.Queues, goJID(j))
+				jid, err := readJID(j, tracker)
+				if err != nil {
+					return nil, err
+				}
+				u.Queues = append(u.Queues, jid)
 			}
 		}
 		out.Unread = u
@@ -381,66 +497,128 @@ func decodeFrame(f *C.EMCodecFrame) *protocol.Frame {
 		var j C.EMCodecJID
 		j.struct_size = C.uint32_t(C.sizeof_EMCodecJID)
 		if C.em_codec_frame_queue(f, &j) != 0 {
-			q := goJID(j)
+			q, err := readJID(j, tracker)
+			if err != nil {
+				return nil, err
+			}
 			out.Notice = &q
 		}
 	case C.EM_CODEC_FRAME_SYNC_ACK, C.EM_CODEC_FRAME_SYNC_BATCH:
-		out.Sync = readSync(f, st)
+		out.Sync, err = readSync(f, st, tracker)
+		if err != nil {
+			return nil, err
+		}
 	case C.EM_CODEC_FRAME_LOGOUT:
 		out.Logout = &protocol.Logout{Status: st}
 	}
-	return out
+	return out, nil
 }
-func readStatus(f *C.EMCodecFrame) *protocol.Status {
+
+func readStatus(f *C.EMCodecFrame, tracker *decodeTracker) (*protocol.Status, error) {
 	code := int32(C.em_codec_frame_status_code(f))
 	if code < 0 {
-		return nil
+		return nil, nil
 	}
-	s := &protocol.Status{Code: protocol.StatusCode(code), Reason: goString(C.em_codec_frame_status_reason(f))}
-	for i := C.size_t(0); i < C.em_codec_frame_redirect_count(f); i++ {
-		s.Redirects = append(s.Redirects, protocol.RedirectInfo{Host: goString(C.em_codec_frame_redirect_host(f, i)), Port: uint32(C.em_codec_frame_redirect_port(f, i))})
+	reason, err := tracker.readString(C.em_codec_frame_status_reason(f))
+	if err != nil {
+		return nil, err
 	}
-	return s
+	redirectCount := uint64(C.em_codec_frame_redirect_count(f))
+	if redirectCount > protocol.MaxFrameCollectionItems {
+		return nil, fmt.Errorf("%w: status redirect count exceeds %d", protocol.ErrLimitExceeded, protocol.MaxFrameCollectionItems)
+	}
+	s := &protocol.Status{Code: protocol.StatusCode(code), Reason: reason, Redirects: make([]protocol.RedirectInfo, 0, int(redirectCount))}
+	for i := C.size_t(0); i < C.size_t(redirectCount); i++ {
+		host, err := tracker.readString(C.em_codec_frame_redirect_host(f, i))
+		if err != nil {
+			return nil, err
+		}
+		s.Redirects = append(s.Redirects, protocol.RedirectInfo{Host: host, Port: uint32(C.em_codec_frame_redirect_port(f, i))})
+	}
+	return s, nil
 }
-func readSync(f *C.EMCodecFrame, st *protocol.Status) *protocol.Sync {
+
+func readSync(f *C.EMCodecFrame, st *protocol.Status, tracker *decodeTracker) (*protocol.Sync, error) {
+	metaCount := uint64(C.em_codec_frame_meta_count(f))
+	if metaCount > protocol.MaxSyncMetas {
+		return nil, fmt.Errorf("%w: sync meta count exceeds %d", protocol.ErrLimitExceeded, protocol.MaxSyncMetas)
+	}
 	s := &protocol.Sync{Status: st, MetaID: uint64(C.em_codec_frame_ack_client_id(f)), ServerID: uint64(C.em_codec_frame_ack_server_id(f)), Timestamp: uint64(C.em_codec_frame_timestamp(f)), NextKey: uint64(C.em_codec_frame_next_key(f)), IsLast: C.em_codec_frame_is_last(f) != 0}
 	var q C.EMCodecJID
 	q.struct_size = C.uint32_t(C.sizeof_EMCodecJID)
 	if C.em_codec_frame_queue(f, &q) != 0 {
-		x := goJID(q)
+		x, err := readJID(q, tracker)
+		if err != nil {
+			return nil, err
+		}
 		s.Queue = &x
 	}
-	for i := C.size_t(0); i < C.em_codec_frame_meta_count(f); i++ {
+	s.Metas = make([]protocol.Meta, 0, int(metaCount))
+	for i := C.size_t(0); i < C.size_t(metaCount); i++ {
 		m := protocol.Meta{ID: uint64(C.em_codec_meta_id(f, i)), Timestamp: uint64(C.em_codec_meta_timestamp(f, i)), Namespace: protocol.Namespace(C.em_codec_meta_namespace(f, i)), Route: protocol.RouteType(C.em_codec_meta_route_type(f, i))}
 		var n C.size_t
-		m.Payload = readBytes(C.em_codec_meta_payload(f, i, &n), n)
+		payload := C.em_codec_meta_payload(f, i, &n)
+		if err := tracker.addPayload(uint64(n)); err != nil {
+			return nil, err
+		}
+		var err error
+		m.Payload, err = readBytes(unsafe.Pointer(payload), uint64(n))
+		if err != nil {
+			return nil, err
+		}
 		var j C.EMCodecJID
 		j.struct_size = C.uint32_t(C.sizeof_EMCodecJID)
 		if C.em_codec_meta_from(f, i, &j) != 0 {
-			m.From = goJID(j)
+			m.From, err = readJID(j, tracker)
+			if err != nil {
+				return nil, err
+			}
 		}
+		j = C.EMCodecJID{}
 		j.struct_size = C.uint32_t(C.sizeof_EMCodecJID)
 		if C.em_codec_meta_to(f, i, &j) != 0 {
-			m.To = goJID(j)
+			m.To, err = readJID(j, tracker)
+			if err != nil {
+				return nil, err
+			}
 		}
-		for u := C.size_t(0); u < C.em_codec_meta_directed_user_count(f, i); u++ {
-			m.DirectedUsers = append(m.DirectedUsers, goString(C.em_codec_meta_directed_user(f, i, u)))
+		userCount := uint64(C.em_codec_meta_directed_user_count(f, i))
+		if err := tracker.addDirectedUsers(userCount); err != nil {
+			return nil, err
+		}
+		m.DirectedUsers = make([]string, 0, int(userCount))
+		for u := C.size_t(0); u < C.size_t(userCount); u++ {
+			user, err := tracker.readString(C.em_codec_meta_directed_user(f, i, u))
+			if err != nil {
+				return nil, err
+			}
+			m.DirectedUsers = append(m.DirectedUsers, user)
 		}
 		s.Metas = append(s.Metas, m)
 	}
-	return s
+	if _, err := protocol.SyncRetainedWeight(s); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
-func readBytes(p *C.uint8_t, n C.size_t) []byte {
-	if p == nil || n == 0 {
-		return nil
+
+func readBytes(p unsafe.Pointer, size uint64) ([]byte, error) {
+	if size == 0 {
+		return nil, nil
 	}
-	if uint64(n) > uint64(^uint32(0)>>1) {
-		return nil
+	if size > protocol.MaxCodecInputBytes {
+		return nil, fmt.Errorf("%w: native byte field exceeds %d bytes", protocol.ErrLimitExceeded, protocol.MaxCodecInputBytes)
 	}
-	return C.GoBytes(unsafe.Pointer(p), C.int(n))
+	if p == nil {
+		return nil, fmt.Errorf("native codec returned nil byte field with size %d", size)
+	}
+	return C.GoBytes(p, C.int(size)), nil
 }
 
 func (c *Codec) DecodeMessageBody(data []byte) (*protocol.MessageBody, error) {
+	if len(data) > protocol.MaxCodecInputBytes {
+		return nil, fmt.Errorf("%w: message body exceeds %d bytes", protocol.ErrLimitExceeded, protocol.MaxCodecInputBytes)
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.handle == nil {
@@ -452,37 +630,74 @@ func (c *Codec) DecodeMessageBody(data []byte) (*protocol.MessageBody, error) {
 		return nil, codecError(e)
 	}
 	defer C.em_codec_frame_free(f)
+	tracker := &decodeTracker{}
+	var err error
 	v := &protocol.MessageBody{Kind: protocol.MessageKind(C.em_codec_meta_message_type(f, 0))}
 	var j C.EMCodecJID
 	j.struct_size = C.uint32_t(C.sizeof_EMCodecJID)
 	if C.em_codec_message_from(f, 0, &j) != 0 {
-		v.From = goJID(j)
+		v.From, err = readJID(j, tracker)
+		if err != nil {
+			return nil, err
+		}
 	}
+	j = C.EMCodecJID{}
 	j.struct_size = C.uint32_t(C.sizeof_EMCodecJID)
 	if C.em_codec_message_to(f, 0, &j) != 0 {
-		v.To = goJID(j)
+		v.To, err = readJID(j, tracker)
+		if err != nil {
+			return nil, err
+		}
 	}
-	v.Ext = readKVs(f, 0, -1)
-	for i := C.size_t(0); i < C.em_codec_meta_content_count(f, 0); i++ {
-		x := protocol.Content{Kind: protocol.ContentKind(C.em_codec_content_type(f, 0, i)), Text: goString(C.em_codec_content_text(f, 0, i)), Action: goString(C.em_codec_content_action(f, 0, i)), Event: goString(C.em_codec_content_custom_event(f, 0, i))}
+	v.Ext, err = readKVs(f, 0, -1, tracker)
+	if err != nil {
+		return nil, err
+	}
+	contentCount := uint64(C.em_codec_meta_content_count(f, 0))
+	if contentCount > protocol.MaxFrameCollectionItems {
+		return nil, fmt.Errorf("%w: message content count exceeds %d", protocol.ErrLimitExceeded, protocol.MaxFrameCollectionItems)
+	}
+	v.Contents = make([]protocol.Content, 0, int(contentCount))
+	for i := C.size_t(0); i < C.size_t(contentCount); i++ {
+		x := protocol.Content{Kind: protocol.ContentKind(C.em_codec_content_type(f, 0, i))}
+		x.Text, err = tracker.readString(C.em_codec_content_text(f, 0, i))
+		if err != nil {
+			return nil, err
+		}
+		x.Action, err = tracker.readString(C.em_codec_content_action(f, 0, i))
+		if err != nil {
+			return nil, err
+		}
+		x.Event, err = tracker.readString(C.em_codec_content_custom_event(f, 0, i))
+		if err != nil {
+			return nil, err
+		}
 		if x.Kind == protocol.ContentCommand {
-			x.Params = readKVs(f, 0, int(i))
+			x.Params, err = readKVs(f, 0, int(i), tracker)
 		} else if x.Kind == protocol.ContentCustom {
-			x.CustomExts = readKVs(f, 0, int(i))
+			x.CustomExts, err = readKVs(f, 0, int(i), tracker)
 		} else if x.Kind > protocol.ContentCustom {
 			var n C.size_t
-			x.RawPayload = readBytes(C.em_codec_content_raw(f, 0, i, &n), n)
+			p := C.em_codec_content_raw(f, 0, i, &n)
+			x.RawPayload, err = readBytes(unsafe.Pointer(p), uint64(n))
+		}
+		if err != nil {
+			return nil, err
 		}
 		v.Contents = append(v.Contents, x)
 	}
 	return v, nil
 }
-func readKVs(f *C.EMCodecFrame, m C.size_t, content int) []protocol.KeyValue {
+
+func readKVs(f *C.EMCodecFrame, m C.size_t, content int, tracker *decodeTracker) ([]protocol.KeyValue, error) {
 	var count C.size_t
 	if content < 0 {
 		count = C.em_codec_meta_key_value_count(f, m)
 	} else {
 		count = C.em_codec_content_key_value_count(f, m, C.size_t(content))
+	}
+	if uint64(count) > protocol.MaxFrameCollectionItems {
+		return nil, fmt.Errorf("%w: key/value count exceeds %d", protocol.ErrLimitExceeded, protocol.MaxFrameCollectionItems)
 	}
 	out := make([]protocol.KeyValue, 0, int(count))
 	for i := C.size_t(0); i < count; i++ {
@@ -497,15 +712,26 @@ func readKVs(f *C.EMCodecFrame, m C.size_t, content int) []protocol.KeyValue {
 		if ok == 0 {
 			continue
 		}
-		x := protocol.KeyValue{Key: goString(v.key), Kind: protocol.KeyValueKind(v._type), Int64: int64(v.integer_value), Double: float64(v.number_value), String: goString(v.string_value)}
+		key, err := tracker.readString(v.key)
+		if err != nil {
+			return nil, err
+		}
+		value, err := tracker.readString(v.string_value)
+		if err != nil {
+			return nil, err
+		}
+		x := protocol.KeyValue{Key: key, Kind: protocol.KeyValueKind(v._type), Int64: int64(v.integer_value), Double: float64(v.number_value), String: value}
 		x.Bool = x.Int64 != 0
 		x.Uint64 = uint64(x.Int64)
 		x.Float = float32(x.Double)
 		out = append(out, x)
 	}
-	return out
+	return out, nil
 }
 func (c *Codec) DecodeStatistic(data []byte) (*protocol.Statistic, error) {
+	if len(data) > protocol.MaxCodecInputBytes {
+		return nil, fmt.Errorf("%w: statistic exceeds %d bytes", protocol.ErrLimitExceeded, protocol.MaxCodecInputBytes)
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.handle == nil {
@@ -517,5 +743,18 @@ func (c *Codec) DecodeStatistic(data []byte) (*protocol.Statistic, error) {
 		return nil, codecError(e)
 	}
 	defer C.em_codec_frame_free(f)
-	return &protocol.Statistic{Operation: protocol.StatisticOperation(C.em_codec_meta_statistic_operation(f, 0)), ReplaceDeviceName: goString(C.em_codec_meta_statistic_device(f, 0)), Reason: goString(C.em_codec_meta_statistic_reason(f, 0)), SessionID: goString(C.em_codec_meta_statistic_session_id(f, 0))}, nil
+	tracker := &decodeTracker{}
+	replaceDeviceName, err := tracker.readString(C.em_codec_meta_statistic_device(f, 0))
+	if err != nil {
+		return nil, err
+	}
+	reason, err := tracker.readString(C.em_codec_meta_statistic_reason(f, 0))
+	if err != nil {
+		return nil, err
+	}
+	sessionID, err := tracker.readString(C.em_codec_meta_statistic_session_id(f, 0))
+	if err != nil {
+		return nil, err
+	}
+	return &protocol.Statistic{Operation: protocol.StatisticOperation(C.em_codec_meta_statistic_operation(f, 0)), ReplaceDeviceName: replaceDeviceName, Reason: reason, SessionID: sessionID}, nil
 }

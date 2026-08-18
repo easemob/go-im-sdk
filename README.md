@@ -68,7 +68,9 @@ func main() {
 `New` 只创建 SDK 实例，`Login(ctx, userID, token)` 才开始 DNS、WSS 和 Provision 登录。
 `Login` 只能在未登录状态调用；`Logout` 后可以使用同一 Client 再次登录。`Send` 要求已登录且连接正常，发送方始终是当前登录用户。SDK 版本由库内部维护，业务不配置 `MsyncHost`、`RestBase` 或 `SDKVersion`。
 
-SDK 固定请求 `https://rs.easemob.com/easemob/server.json`，并携带 `sdk_version`、`app_key` 和 `file_version=1`。返回的 `msync-wx.hosts` 和 `rest.hosts` 分别决定 WSS 与 REST 地址；优先选择 `priority=1`，否则使用第一个有效 host。WSS 接受 `wss` 或可转换为 `wss` 的 `https`，REST 只接受 `https`。缺少任一有效地址、HTTP 失败、响应过大或 JSON 无效都会直接使登录失败。
+`Close(ctx)` 首次调用时会立即把 Client 标记为永久关闭并取消当前连接，随后在后台等待正在进行的登录、重连或登出操作退出，再销毁共享 native codec。只有返回 `nil` 才表示这个共享收尾已完成；如果 ctx 先结束则返回 `ctx.Err()`，收尾仍会继续，后续 `Close` 会等待同一个结果。需要有界关闭时延时必须传入带 deadline 的 context。自定义 `HTTPClient.Transport` 必须遵守 `Request.Context`；Go 无法强制终止一个永不返回的 Transport，因此这种错误配置下 `Close(context.Background())` 也可能永久等待。SDK 不会通过另起 goroutine 假装已终止这类请求，因为那会掩盖泄漏并可能过早销毁 codec。
+
+SDK 固定请求 `https://rs.easemob.com/easemob/server.json`，并携带 `sdk_version`、`app_key` 和 `file_version=1`。返回的 `msync-wx.hosts` 会按 `priority=1` 优先且保持服务端顺序，最多保留 64 个去重后的安全 WSS 候选；登录和重连遇到 endpoint-local 网络错误时会轮换候选，一轮耗尽后重新获取 DNS。Provision redirect 成功后的最终地址会成为当前 effective endpoint。REST 仍只选择一个 `priority=1` HTTPS 地址，不做多地址切换。进程内相同 AppKey 和同一 `*http.Client` 共享 DNS 请求与 5 分钟 fresh cache；刷新暂时失败时，已验证结果最多 stale 使用 30 分钟。缺少有效地址、响应过大或 JSON 无效仍会直接失败。
 
 `Resource` 是必填的原始稳定设备身份，首次部署时应生成 UUID 一类具有足够随机性的字符串。业务必须持久化原始值；同一逻辑服务发生宕机、重启或故障转移时必须继续使用原值。更换 Resource 会被服务端视为从另一台设备登录。已经上线的实例即使旧值不是 UUID 格式，也必须继续使用已持久化的旧值，不能为了改格式而替换。SDK 不自动生成或持久化 Resource。SDK 实际使用 `go-server-imsdk-<resource>`；前缀计入最终 128 字符限制，最终值不得包含空白、`/` 或 `@`。
 
@@ -100,8 +102,8 @@ flowchart TD
 
     subgraph 登录 Login(ctx, userID, token)
         F["校验参数 + 加锁"] --> G["状态 LoggingIn/Connecting<br/>回调 ConnStateConnecting"]
-        G --> H["resolveLoginEndpoints<br/>DNS 引导取 WSS/REST 地址"]
-        H --> I["connectWithRedirects<br/>WebSocket 拨号，起 readPump/writePump"]
+        G --> H["resolveCachedEndpointCandidates<br/>DNS/cache 取 WSS 候选与 REST 地址"]
+        H --> I["候选轮换 + connectWithRedirects<br/>WebSocket 拨号，起 readPump/writePump"]
         I --> J["发送 PROVISION 登录帧"]
         J --> K{"PROVISION 响应"}
         K -->|OK| L["acceptProvision 记录 sessionID/token"]
@@ -166,7 +168,7 @@ sequenceDiagram
 ### 心跳与重连
 
 - **心跳**：`heartbeat` 协程每 `HeartbeatInterval`(120s) 发一个空 `UNREAD` 当 ping；收到 `UNREAD` 下行当 pong 并更新 `lastPong`；超过 `HeartbeatTimeout`(240s) 未收到 pong、或 readPump 读超时则断链。
-- **网络断线自动重连**：状态切 `Reconnecting`，三段随机退避（5~10s / 20~40s / 60~120s），稳定运行超 5 分钟重置退避档位；重连后队列游标从 0 重新开始，可能重投历史消息，业务需按 `MetaID` 幂等。
+- **网络断线自动重连**：状态切 `Reconnecting`，三段随机退避（5~10s / 20~40s / 60~120s）；每个退避周期最多拨号一个 WSS endpoint，endpoint-local 失败才推进候选，一轮耗尽后合并刷新 DNS，切 host 或刷新 DNS 都不会重置退避。稳定运行超 5 分钟才重置退避档位；重连后队列游标从 0 重新开始，可能重投历史消息，业务需按 `MetaID` 幂等。
 - **业务性断开不重连**：被踢出、鉴权失败、token 过期等进入终态，触发 `OnDisconnect`。
 
 ## 回调处理

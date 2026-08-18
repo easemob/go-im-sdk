@@ -21,9 +21,10 @@ type writeRequest struct {
 	done  chan error
 }
 type batchJob struct {
-	id string
-	d  *internalprotocol.Sync
-	r  *connectionRun
+	queue       queueKey
+	d           *internalprotocol.Sync
+	r           *connectionRun
+	reservation *batchReservation
 }
 type ackResult struct {
 	result *SendResult
@@ -35,27 +36,76 @@ type provisionResult struct {
 }
 
 type connectionRun struct {
-	client       *Client
-	ctx          context.Context
-	cancel       context.CancelFunc
-	conn         *websocket.Conn
-	endpoint     string
-	generation   uint64
-	writes       chan writeRequest
-	provision    chan provisionResult
-	logout       chan error
-	done         chan struct{}
-	closeOnce    sync.Once
-	wg           sync.WaitGroup
-	pendingMu    sync.Mutex
-	pending      map[uint64]chan ackResult
-	queueMu      sync.Mutex
-	queues       map[string]*queueState
-	activeQueues atomic.Int32
-	lastPong     atomic.Int64
+	client             *Client
+	ctx                context.Context
+	cancel             context.CancelFunc
+	conn               *websocket.Conn
+	endpoint           string
+	generation         uint64
+	writes             chan writeRequest
+	provision          chan provisionResult
+	logout             chan error
+	done               chan struct{}
+	closeOnce          sync.Once
+	finalizeOnce       sync.Once
+	wg                 sync.WaitGroup
+	pendingMu          sync.Mutex
+	pending            map[uint64]chan ackResult
+	queueMu            sync.Mutex
+	queues             map[queueKey]*queueState
+	deferred           deferredQueueRing
+	pullRequests       chan *queueState
+	queueBudget        *byteBudget
+	queueTimeout       time.Duration
+	processBatchBudget *byteBudget
+	decodeBudget       *byteBudget
+	decodeWait         time.Duration
+	activeQueues       atomic.Int32
+	capacityHits       atomic.Uint64
+	lastPong           atomic.Int64
 }
 
 func (c *Client) isClosed() bool { c.mu.RLock(); defer c.mu.RUnlock(); return c.closed }
+
+// beginConnect serializes lifecycle operations without forcing callers to wait
+// on an uninterruptible mutex. The returned channel is an ownership token and
+// must be passed to endConnect on every path after successful acquisition.
+func (c *Client) beginConnect(ctx context.Context, operation string) (chan struct{}, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return nil, newError(ErrClientClosed, operation, "")
+		}
+		if c.connectDone == nil {
+			done := make(chan struct{})
+			c.connectDone = done
+			c.mu.Unlock()
+			return done, nil
+		}
+		done := c.connectDone
+		c.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func (c *Client) endConnect(done chan struct{}) {
+	c.mu.Lock()
+	if c.connectDone != done {
+		c.mu.Unlock()
+		panic("sdk: ending a lifecycle operation not owned by caller")
+	}
+	c.connectDone = nil
+	close(done)
+	c.mu.Unlock()
+}
 
 // Login 使用 userID/token 建立长连接会话。userID 应尽量使用全小写（大小写混杂
 // 也可以），但务必保证该账号不会在移动端 SDK 上登录：移动端会把 userID 统一转为
@@ -67,9 +117,15 @@ func (c *Client) Login(ctx context.Context, userID, token string) error {
 	if strings.TrimSpace(token) == "" {
 		return newError(ErrNotLoggedIn, "login", "token is empty")
 	}
-	c.connectMu.Lock()
-	defer c.connectMu.Unlock()
+	connectDone, err := c.beginConnect(ctx, "login")
+	if err != nil {
+		return err
+	}
+	defer c.endConnect(connectDone)
 	c.mu.Lock()
+	// Close does not wait before marking the Client closed, so it may win the
+	// race immediately after beginConnect grants ownership. Recheck while
+	// installing login state to preserve Close's immediate Logout invariant.
 	if c.closed {
 		c.mu.Unlock()
 		return newError(ErrClientClosed, "login", "")
@@ -94,16 +150,12 @@ func (c *Client) Login(ctx context.Context, userID, token string) error {
 	defer cancel()
 	stopLifecycleCancel := context.AfterFunc(c.eventCtx, cancel)
 	defer stopLifecycleCancel()
-	msyncHost, restBase, err := c.resolveLoginEndpoints(connectCtx)
+	resolved, err := c.resolveCachedEndpointCandidates(connectCtx, 0)
 	if err != nil {
 		c.recordTerminal(err)
 		return err
 	}
-	c.mu.Lock()
-	c.msyncHost = msyncHost
-	c.restBase = restBase
-	c.mu.Unlock()
-	r, err := c.connectWithRedirects(connectCtx, msyncHost)
+	r, usedIndex, err := c.connectLoginCandidates(connectCtx, resolved.Endpoints.WSS)
 	if err != nil {
 		c.recordTerminal(err)
 		return err
@@ -117,6 +169,11 @@ func (c *Client) Login(ctx context.Context, userID, token string) error {
 	c.run = r
 	c.state = LoginStateLoggedIn
 	c.connState = ConnStateConnected
+	c.msyncHost = r.endpoint
+	c.msyncHosts = append([]string(nil), resolved.Endpoints.WSS...)
+	c.msyncCursor = nextCandidateCursor(usedIndex, len(c.msyncHosts))
+	c.dnsGeneration = resolved.Generation
+	c.restBase = resolved.Endpoints.REST
 	c.lastStableConnect.Store(time.Now().UnixNano())
 	c.mu.Unlock()
 	if cb != nil {
@@ -124,6 +181,51 @@ func (c *Client) Login(ctx context.Context, userID, token string) error {
 	}
 	go c.monitor(r)
 	return nil
+}
+
+const endpointConnectTimeout = 5 * time.Second
+
+func (c *Client) connectLoginCandidates(ctx context.Context, candidates []string) (*connectionRun, int, error) {
+	round := newEndpointRound(candidates, 0)
+	var lastErr error
+	for !round.exhausted() {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return nil, -1, lastErr
+			}
+			return nil, -1, classifyNetworkError("login endpoints", err)
+		}
+		endpoint, index, _ := round.nextEndpoint()
+		attemptCtx, cancel := context.WithTimeout(ctx, endpointConnectTimeout)
+		r, err := c.connectEndpoint(attemptCtx, endpoint)
+		cancel()
+		if err == nil {
+			return r, index, nil
+		}
+		lastErr = err
+		if c.debug {
+			c.logger.Debug("msync.endpoint_failed", "phase", "login", "candidate_index", index,
+				"candidate_count", len(candidates), "error_code", errorCode(err))
+		}
+		if !shouldRotateEndpoint(err) {
+			return nil, index, err
+		}
+	}
+	return nil, -1, lastErr
+}
+
+func (c *Client) connectEndpoint(ctx context.Context, endpoint string) (*connectionRun, error) {
+	if c.connectEndpointFn != nil {
+		return c.connectEndpointFn(ctx, endpoint)
+	}
+	return c.connectWithRedirects(ctx, endpoint)
+}
+
+func nextCandidateCursor(usedIndex, candidateCount int) int {
+	if candidateCount == 0 || usedIndex < 0 {
+		return 0
+	}
+	return (usedIndex + 1) % candidateCount
 }
 
 func (c *Client) connectWithRedirects(ctx context.Context, endpoint string) (*connectionRun, error) {
@@ -176,11 +278,20 @@ func (c *Client) dial(ctx context.Context, endpoint string) (*connectionRun, err
 	}
 	conn.SetReadLimit(maxFrameBytes)
 	rctx, cancel := context.WithCancel(context.Background())
-	r := &connectionRun{client: c, ctx: rctx, cancel: cancel, conn: conn, endpoint: endpoint, generation: c.generation.Add(1), writes: make(chan writeRequest, writeQueueSize), provision: make(chan provisionResult, 1), logout: make(chan error, 1), done: make(chan struct{}), pending: map[uint64]chan ackResult{}, queues: map[string]*queueState{}}
+	r := &connectionRun{
+		client: c, ctx: rctx, cancel: cancel, conn: conn, endpoint: endpoint,
+		generation: c.generation.Add(1), writes: make(chan writeRequest, writeQueueSize),
+		provision: make(chan provisionResult, 1), logout: make(chan error, 1),
+		done: make(chan struct{}), pending: map[uint64]chan ackResult{},
+		queues: make(map[queueKey]*queueState), deferred: newDeferredQueueRing(maxTrackedQueues),
+		pullRequests: make(chan *queueState, pullRequestCapacity),
+		queueBudget:  mustNewByteBudget(connectionQueueBudgetBytes), queueTimeout: queueResponseTimeout,
+	}
 	r.lastPong.Store(time.Now().UnixNano())
 	r.wg.Add(2)
 	go r.writePump()
 	go r.readPump()
+	r.startPullScheduler()
 	return r, nil
 }
 
@@ -279,19 +390,65 @@ func (r *connectionRun) readPump() {
 			continue
 		}
 		r.client.lastInbound.Store(time.Now().UnixNano())
-		frame, decodeErr := r.client.codec.DecodeFrame(data)
-		if decodeErr != nil {
+		if decodeErr := r.decodeAndDispatch(data); decodeErr != nil {
+			if r.ctx.Err() != nil {
+				return
+			}
 			if r.client.debug {
 				r.client.logger.Debug("wss.decode_error", "generation", r.generation, "bytes", len(data), "error", decodeErr)
 			}
-			r.fail(wrapError(ErrProtocol, "decode frame", decodeErr))
+			r.fail(decodeErr)
 			return
 		}
-		if r.client.debug {
-			r.client.logger.Debug("wss.inbound", "generation", r.generation, "command", frame.Command, "trace_id", frame.TraceID, "bytes", len(data))
-		}
-		r.dispatch(frame)
 	}
+}
+
+func (r *connectionRun) decodeAndDispatch(data []byte) error {
+	budget := r.decodeBudget
+	if budget == nil {
+		budget = processDecodeBudget
+	}
+	wait := r.decodeWait
+	if wait <= 0 {
+		wait = decodeAdmissionWait
+	}
+	weight, err := decodeAdmissionWeight(r.client.codec, data)
+	if err != nil {
+		if errors.Is(err, internalprotocol.ErrLimitExceeded) {
+			return wrapError(ErrProtocolLimit, "decode frame", err)
+		}
+		return wrapError(ErrProtocol, "decode frame", err)
+	}
+	waitCtx, cancel := context.WithTimeout(r.ctx, wait)
+	err = budget.Acquire(waitCtx, weight)
+	cancel()
+	if err != nil {
+		if r.ctx.Err() != nil {
+			return r.ctx.Err()
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			r.client.decodeTimeouts.Add(1)
+		}
+		return wrapError(ErrHandlerBacklog, "decode admission", err)
+	}
+	defer func() {
+		if releaseErr := budget.Release(weight); releaseErr != nil {
+			r.client.logger.Error("decode budget release invariant failed", "bytes", weight, "error", releaseErr)
+		}
+	}()
+	frame, err := r.client.codec.DecodeFrame(data)
+	if err != nil {
+		code := ErrProtocol
+		if errors.Is(err, internalprotocol.ErrLimitExceeded) {
+			code = ErrProtocolLimit
+		}
+		return wrapError(code, "decode frame", err)
+	}
+	if r.client.debug {
+		r.client.logger.Debug("wss.inbound", "generation", r.generation, "command", frame.Command, "trace_id", frame.TraceID, "bytes", len(data))
+	}
+	r.dispatch(frame)
+	return nil
 }
 
 func (r *connectionRun) dispatch(frame *internalprotocol.Frame) {
@@ -511,15 +668,22 @@ func (r *connectionRun) fail(err error) {
 		r.client.mu.Unlock()
 		close(r.done)
 		r.cancel()
-		_ = r.conn.Close()
+		if r.conn != nil {
+			_ = r.conn.Close()
+		}
 		r.cancelPending(err)
 	})
 }
-func (r *connectionRun) shutdown(err error) { r.fail(err); r.wg.Wait() }
+func (r *connectionRun) shutdown(err error) {
+	r.fail(err)
+	r.wg.Wait()
+	r.finalizeQueues()
+}
 
 func (c *Client) monitor(r *connectionRun) {
 	<-r.done
 	r.wg.Wait()
+	r.finalizeQueues()
 	c.mu.RLock()
 	current := c.run == r
 	closed := c.closed
@@ -546,12 +710,24 @@ func (c *Client) reconnect(old *connectionRun) {
 	c.connState = ConnStateReconnecting
 	stateCallback := c.callbacks.connection
 	userID := c.userID
-	endpoint := c.msyncHost
+	effectiveEndpoint := c.msyncHost
+	hosts := append([]string(nil), c.msyncHosts...)
+	cursor := c.msyncCursor
+	dnsGeneration := c.dnsGeneration
 	lastErr := c.lastErr
+	delayFn := c.reconnectDelayFn
 	c.mu.Unlock()
+	if delayFn == nil {
+		delayFn = reconnectDelay
+	}
 	if changed && stateCallback != nil {
 		c.emit(func() { stateCallback(userID, ConnStateReconnecting) })
 	}
+
+	round := newEndpointRound(hosts, cursor)
+	endpoint := effectiveEndpoint
+	endpointIndex := -1
+	needRefresh := false
 	var redirect *redirectError
 	if errors.As(lastErr, &redirect) {
 		if next, err := redirectURL(old.endpoint, redirect.info); err == nil {
@@ -560,6 +736,10 @@ func (c *Client) reconnect(old *connectionRun) {
 			c.recordTerminalForRun(old, err)
 			return
 		}
+	} else if shouldRotateEndpoint(lastErr) {
+		var ok bool
+		endpoint, endpointIndex, ok = round.nextEndpoint()
+		needRefresh = !ok
 	}
 	// 跨代际退避：连接只有在稳定运行超过 reconnectStableWindow 后才重置退避档位；
 	// 否则毒消息/慢消费者导致的频繁重建会让退避跨代际累积到最高档，避免自伤式重连风暴。
@@ -575,7 +755,7 @@ func (c *Client) reconnect(old *connectionRun) {
 		if closed || !current {
 			return
 		}
-		timer := time.NewTimer(reconnectDelay(attempt))
+		timer := time.NewTimer(delayFn(attempt))
 		select {
 		case <-timer.C:
 		case <-c.eventCtx.Done():
@@ -593,40 +773,108 @@ func (c *Client) reconnect(old *connectionRun) {
 		if c.isClosed() || !current {
 			return
 		}
-		c.connectMu.Lock()
-		ctx, cancel := context.WithTimeout(c.eventCtx, connectTimeout)
-		r, err := c.connectWithRedirects(ctx, endpoint)
-		cancel()
-		c.connectMu.Unlock()
-		if err != nil {
-			if c.isClosed() {
-				return
+		stop := func() bool {
+			connectDone, err := c.beginConnect(c.eventCtx, "reconnect")
+			if err != nil {
+				return true
+			}
+			defer c.endConnect(connectDone)
+			// State may have changed while this attempt waited behind Login or
+			// Logout. Revalidate after acquiring lifecycle ownership.
+			c.mu.RLock()
+			closed = c.closed
+			current = c.run == old && c.state == LoginStateReconnecting
+			c.mu.RUnlock()
+			if closed || !current {
+				return true
+			}
+			ctx, cancel := context.WithTimeout(c.eventCtx, connectTimeout)
+			defer cancel()
+			if needRefresh {
+				resolved, err := c.resolveCachedEndpointCandidates(ctx, dnsGeneration)
+				if err != nil {
+					c.mu.Lock()
+					c.lastErr = err
+					c.mu.Unlock()
+					if isTerminal(err) {
+						c.recordTerminalForRun(old, err)
+						return true
+					}
+					return false
+				}
+				hosts = append(hosts[:0], resolved.Endpoints.WSS...)
+				dnsGeneration = resolved.Generation
+				cursor = 0
+				round = newEndpointRound(hosts, cursor)
+				endpoint, endpointIndex, _ = round.nextEndpoint()
+				needRefresh = false
+				c.mu.Lock()
+				if c.run == old && c.state == LoginStateReconnecting {
+					c.msyncHosts = append([]string(nil), hosts...)
+					c.msyncCursor = cursor
+					c.dnsGeneration = dnsGeneration
+					c.restBase = resolved.Endpoints.REST
+				}
+				c.mu.Unlock()
+				if c.debug {
+					c.logger.Debug("dns.reconnect_refresh", "generation", dnsGeneration,
+						"stale", resolved.Stale, "candidate_count", len(hosts))
+				}
+			}
+
+			r, err := c.connectEndpoint(ctx, endpoint)
+			if err != nil {
+				if c.isClosed() {
+					return true
+				}
+				c.mu.Lock()
+				c.lastErr = err
+				c.mu.Unlock()
+				if isTerminal(err) {
+					c.recordTerminalForRun(old, err)
+					return true
+				}
+				if c.debug {
+					c.logger.Debug("msync.endpoint_failed", "phase", "reconnect", "candidate_index", endpointIndex,
+						"candidate_count", len(hosts), "dns_generation", dnsGeneration, "error_code", errorCode(err))
+				}
+				if shouldRotateEndpoint(err) {
+					var ok bool
+					endpoint, endpointIndex, ok = round.nextEndpoint()
+					needRefresh = !ok
+				} else {
+					endpoint = effectiveEndpoint
+					endpointIndex = -1
+				}
+				return false
 			}
 			c.mu.Lock()
-			c.lastErr = err
-			c.mu.Unlock()
-			if isTerminal(err) {
-				c.recordTerminalForRun(old, err)
-				return
+			if c.closed || c.run != old {
+				c.mu.Unlock()
+				r.shutdown(newError(ErrClientClosed, "reconnect", "superseded"))
+				return true
 			}
-			continue
-		}
-		c.mu.Lock()
-		if c.closed || c.run != old {
+			c.run = r
+			c.state = LoginStateLoggedIn
+			c.connState = ConnStateConnected
+			c.msyncHost = r.endpoint
+			c.msyncHosts = append([]string(nil), hosts...)
+			if endpointIndex >= 0 {
+				cursor = nextCandidateCursor(endpointIndex, len(hosts))
+			}
+			c.msyncCursor = cursor
+			c.dnsGeneration = dnsGeneration
+			c.lastStableConnect.Store(time.Now().UnixNano())
 			c.mu.Unlock()
-			r.shutdown(newError(ErrClientClosed, "reconnect", "superseded"))
+			if cb := c.callbackSnapshot().connection; cb != nil {
+				c.emit(func() { cb(userID, ConnStateConnected) })
+			}
+			go c.monitor(r)
+			return true
+		}()
+		if stop {
 			return
 		}
-		c.run = r
-		c.state = LoginStateLoggedIn
-		c.connState = ConnStateConnected
-		c.lastStableConnect.Store(time.Now().UnixNano())
-		c.mu.Unlock()
-		if cb := c.callbackSnapshot().connection; cb != nil {
-			c.emit(func() { cb(userID, ConnStateConnected) })
-		}
-		go c.monitor(r)
-		return
 	}
 }
 
@@ -647,7 +895,7 @@ func reconnectDelay(attempt int) time.Duration {
 
 func isTerminal(err error) bool {
 	switch errorCode(err) {
-	case ErrTokenExpired, ErrInvalidToken, ErrUserForbidden, ErrBindAnotherDevice, ErrTooManyDevices, ErrResourceChanged, ErrAuthentication, ErrPermissionDenied, ErrAppActiveLimit, ErrUserNotFound, ErrKickedChangePass:
+	case ErrTokenExpired, ErrInvalidToken, ErrUserForbidden, ErrBindAnotherDevice, ErrTooManyDevices, ErrResourceChanged, ErrAuthentication, ErrPermissionDenied, ErrAppActiveLimit, ErrUserNotFound, ErrKickedChangePass, ErrProtocolLimit:
 		return true
 	}
 	return false
@@ -672,6 +920,9 @@ func (c *Client) recordTerminalForRun(expected *connectionRun, err error) {
 	c.userID = ""
 	c.token = ""
 	c.msyncHost = ""
+	c.msyncHosts = nil
+	c.msyncCursor = 0
+	c.dnsGeneration = 0
 	c.restBase = ""
 	c.tokenExpiresAt = time.Time{}
 	if c.tokenWarningCancel != nil {
@@ -698,47 +949,95 @@ func (c *Client) fireErrorCallback(userID string, err error) {
 	}
 }
 
+// Close permanently closes the Client. The first call marks it closed and
+// cancels its active connection immediately, then a shared finalizer waits for
+// any in-flight lifecycle operation before destroying the native codec.
+//
+// A nil return means that shared finalizer has completed. If ctx expires first,
+// Close returns ctx.Err while finalization continues asynchronously; later calls
+// wait for the same finalizer. Callers that need bounded shutdown latency must
+// pass a context with a deadline. In particular, Close(context.Background()) can
+// wait forever when a custom HTTP transport ignores Request.Context and never
+// returns.
 func (c *Client) Close(ctx context.Context) error {
-	c.mu.Lock()
-	if c.closed {
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.closed = true
+		c.eventCancel()
+		if c.tokenWarningCancel != nil {
+			c.tokenWarningCancel()
+			c.tokenWarningCancel = nil
+		}
+		r := c.run
+		c.run = nil
+		c.state = LoginStateLogout
+		c.connState = ConnStateDisconnected
+		c.sessionID = ""
+		c.userID = ""
+		c.token = ""
+		c.msyncHost = ""
+		c.msyncHosts = nil
+		c.msyncCursor = 0
+		c.dnsGeneration = 0
+		c.restBase = ""
+		c.tokenExpiresAt = time.Time{}
 		c.mu.Unlock()
+		go c.finalizeClose(r)
+	})
+	select {
+	case <-c.closeDone:
 		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	c.closed = true
-	c.eventCancel()
-	if c.tokenWarningCancel != nil {
-		c.tokenWarningCancel()
-		c.tokenWarningCancel = nil
-	}
-	r := c.run
-	c.run = nil
-	c.state = LoginStateLogout
-	c.connState = ConnStateDisconnected
-	c.sessionID = ""
-	c.userID = ""
-	c.token = ""
-	c.msyncHost = ""
-	c.restBase = ""
-	c.tokenExpiresAt = time.Time{}
-	c.mu.Unlock()
+}
+
+func (c *Client) finalizeClose(r *connectionRun) {
 	if r != nil {
 		r.shutdown(newError(ErrClientClosed, "close", ""))
 	}
-	// Wait until an in-flight initial/reconnect handshake has stopped before
-	// destroying the shared native codec handle.
-	c.connectMu.Lock()
-	c.connectMu.Unlock()
+	// closed prevents a new lifecycle operation from registering. The one
+	// observed here (if any) owns cleanup of every temporary run it created.
+	c.mu.RLock()
+	connectDone := c.connectDone
+	c.mu.RUnlock()
+	if connectDone != nil {
+		<-connectDone
+	}
+	c.waitPendingDNSFlights()
+	c.drainBatchJobs()
 	if closer, ok := c.codec.(interface{ Close() }); ok {
 		closer.Close()
 	}
 	// Do not wait for eventWG here: a callback is allowed to call Close, and
 	// waiting from the dispatcher goroutine would deadlock on itself.
-	return nil
+	close(c.closeDone)
 }
 
+func (c *Client) drainBatchJobs() {
+	for {
+		select {
+		case job := <-c.batches:
+			if job.reservation != nil {
+				if err := job.reservation.Release(); err != nil && c.logger != nil {
+					c.logger.Error("batch budget drain invariant failed", "error", err)
+				}
+			}
+		default:
+			return
+		}
+	}
+}
+
+// Logout ends the current session while keeping the Client reusable. Waiting
+// for another lifecycle operation is governed by ctx; if that wait times out,
+// Logout returns ctx.Err without clearing the current login state.
 func (c *Client) Logout(ctx context.Context) error {
-	c.connectMu.Lock()
-	defer c.connectMu.Unlock()
+	connectDone, err := c.beginConnect(ctx, "logout")
+	if err != nil {
+		return err
+	}
+	defer c.endConnect(connectDone)
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -754,6 +1053,9 @@ func (c *Client) Logout(ctx context.Context) error {
 	c.sessionID = ""
 	c.userID = ""
 	c.msyncHost = ""
+	c.msyncHosts = nil
+	c.msyncCursor = 0
+	c.dnsGeneration = 0
 	c.restBase = ""
 	c.tokenExpiresAt = time.Time{}
 	if c.tokenWarningCancel != nil {

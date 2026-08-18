@@ -6,12 +6,14 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/easemob/go-im-sdk/internal/protocol"
 )
 
 const (
 	msyncCompressField = 4
 	msyncPayloadField  = 9
-	maxEnvelopePayload = 16 << 20
+	maxEnvelopeFields  = 4096
 )
 
 // decompressEnvelopePayload removes the optional zlib compression from the
@@ -21,43 +23,28 @@ const (
 // independent of generated Go protobuf code lets the public SDK ship only the
 // native static archive and C ABI header.
 func decompressEnvelopePayload(data []byte) ([]byte, error) {
-	fields, err := parseWireFields(data)
+	if len(data) > protocol.MaxCodecInputBytes {
+		return nil, fmt.Errorf("%w: msync envelope exceeds %d bytes", protocol.ErrLimitExceeded, protocol.MaxCodecInputBytes)
+	}
+	envelope, err := scanEnvelope(data)
 	if err != nil {
 		return nil, fmt.Errorf("parse msync envelope: %w", err)
 	}
-	compression := uint64(0)
-	hasCompression := false
-	var compressed []byte
-	for _, field := range fields {
-		switch field.number {
-		case msyncCompressField:
-			if field.wireType != wireVarint {
-				return nil, fmt.Errorf("msync compress_algorimth has wire type %d", field.wireType)
-			}
-			compression = field.varint
-			hasCompression = true
-		case msyncPayloadField:
-			if field.wireType != wireBytes {
-				return nil, fmt.Errorf("msync payload has wire type %d", field.wireType)
-			}
-			compressed = field.bytes
-		}
-	}
-	if !hasCompression || compression == 0 {
+	if !envelope.hasCompression || envelope.compression == 0 {
 		return data, nil
 	}
-	if compression != 1 {
-		return nil, fmt.Errorf("unsupported payload compression algorithm %d", compression)
+	if envelope.compression != 1 {
+		return nil, fmt.Errorf("unsupported payload compression algorithm %d", envelope.compression)
 	}
-	if compressed == nil {
+	if !envelope.hasPayload {
 		return nil, fmt.Errorf("compressed msync envelope has no payload")
 	}
 
-	reader, err := zlib.NewReader(bytes.NewReader(compressed))
+	reader, err := zlib.NewReader(bytes.NewReader(envelope.payload))
 	if err != nil {
 		return nil, fmt.Errorf("open zlib payload: %w", err)
 	}
-	payload, readErr := io.ReadAll(io.LimitReader(reader, maxEnvelopePayload+1))
+	payload, readErr := io.ReadAll(io.LimitReader(reader, protocol.MaxCodecInputBytes+1))
 	closeErr := reader.Close()
 	if readErr != nil {
 		return nil, fmt.Errorf("read zlib payload: %w", readErr)
@@ -65,27 +52,69 @@ func decompressEnvelopePayload(data []byte) ([]byte, error) {
 	if closeErr != nil {
 		return nil, fmt.Errorf("close zlib payload: %w", closeErr)
 	}
-	if len(payload) > maxEnvelopePayload {
-		return nil, fmt.Errorf("decompressed payload exceeds %d bytes", maxEnvelopePayload)
+	if len(payload) > protocol.MaxCodecInputBytes {
+		return nil, fmt.Errorf("%w: decompressed payload exceeds %d bytes", protocol.ErrLimitExceeded, protocol.MaxCodecInputBytes)
 	}
 
-	var out []byte
-	for _, field := range fields {
-		switch field.number {
-		case msyncCompressField:
-			// Preserve the field position and clear compression for the native
-			// decoder. MSync defines this as an optional uint32 field.
-			out = appendKey(out, field.number, wireVarint)
-			out = appendVarint(out, 0)
-		case msyncPayloadField:
-			out = appendKey(out, field.number, wireBytes)
-			out = appendVarint(out, uint64(len(payload)))
-			out = append(out, payload...)
+	outLen, err := rebuiltEnvelopeSize(len(data), envelope, len(payload))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, outLen)
+
+	first, second := envelope.compressionRaw, envelope.payloadRaw
+	firstPayload := false
+	if second.start < first.start {
+		first, second = second, first
+		firstPayload = true
+	}
+	out = append(out, data[:first.start]...)
+	if firstPayload {
+		out = appendPayloadField(out, payload)
+	} else {
+		out = appendCompressionField(out)
+	}
+	out = append(out, data[first.end:second.start]...)
+	if firstPayload {
+		out = appendCompressionField(out)
+	} else {
+		out = appendPayloadField(out, payload)
+	}
+	out = append(out, data[second.end:]...)
+	return out, nil
+}
+
+func estimateDecodeAdmission(data []byte) (protocol.DecodeAdmissionClass, error) {
+	if len(data) > protocol.MaxCodecInputBytes {
+		return 0, fmt.Errorf("%w: msync envelope exceeds %d bytes", protocol.ErrLimitExceeded, protocol.MaxCodecInputBytes)
+	}
+	envelope, err := scanEnvelope(data)
+	if err != nil {
+		return 0, fmt.Errorf("parse msync envelope admission: %w", err)
+	}
+	if envelope.hasCompression {
+		switch envelope.compression {
+		case 0:
+			// Classify by input size below.
+		case 1:
+			if !envelope.hasPayload {
+				return 0, fmt.Errorf("compressed msync envelope has no payload")
+			}
+			return protocol.DecodeAdmissionCompressed, nil
 		default:
-			out = append(out, field.raw...)
+			return protocol.DecodeAdmissionAmbiguous, nil
 		}
 	}
-	return out, nil
+	switch {
+	case len(data) <= 64<<10:
+		return protocol.DecodeAdmissionTiny, nil
+	case len(data) <= 1<<20:
+		return protocol.DecodeAdmissionSmall, nil
+	case len(data) <= 4<<20:
+		return protocol.DecodeAdmissionLarge, nil
+	default:
+		return protocol.DecodeAdmissionAmbiguous, nil
+	}
 }
 
 const (
@@ -97,67 +126,155 @@ const (
 	wireFixed32    = 5
 )
 
-type wireField struct {
-	number   uint64
-	wireType byte
-	varint   uint64
-	bytes    []byte
-	raw      []byte
+type wireRange struct {
+	start int
+	end   int
 }
 
-func parseWireFields(data []byte) ([]wireField, error) {
-	fields := make([]wireField, 0, 8)
+type envelopeScan struct {
+	fieldCount     int
+	hasCompression bool
+	compression    uint64
+	compressionRaw wireRange
+	hasPayload     bool
+	payload        []byte
+	payloadRaw     wireRange
+}
+
+// scanEnvelope validates the complete protobuf wire stream while retaining
+// only the two singular fields needed by the compression adapter. Its memory
+// use is constant regardless of the number of envelope fields.
+func scanEnvelope(data []byte) (envelopeScan, error) {
+	var result envelopeScan
 	for offset := 0; offset < len(data); {
 		start := offset
 		tag, next, err := readVarint(data, offset)
 		if err != nil {
-			return nil, err
+			return envelopeScan{}, err
 		}
 		offset = next
 		number := tag >> 3
 		wireType := byte(tag & 7)
 		if number == 0 {
-			return nil, fmt.Errorf("invalid field number 0")
+			return envelopeScan{}, fmt.Errorf("invalid field number 0")
 		}
-		field := wireField{number: number, wireType: wireType}
+		result.fieldCount++
+		if result.fieldCount > maxEnvelopeFields {
+			return envelopeScan{}, fmt.Errorf("%w: msync envelope has more than %d fields", protocol.ErrLimitExceeded, maxEnvelopeFields)
+		}
+		if number == msyncCompressField && result.hasCompression {
+			return envelopeScan{}, fmt.Errorf("%w: duplicate msync compression field", protocol.ErrLimitExceeded)
+		}
+		if number == msyncPayloadField && result.hasPayload {
+			return envelopeScan{}, fmt.Errorf("%w: duplicate msync payload field", protocol.ErrLimitExceeded)
+		}
+
+		var varintValue uint64
+		var bytesValue []byte
 		switch wireType {
 		case wireVarint:
 			value, next, err := readVarint(data, offset)
 			if err != nil {
-				return nil, err
+				return envelopeScan{}, err
 			}
-			field.varint = value
+			varintValue = value
 			offset = next
 		case wireFixed64:
 			if len(data)-offset < 8 {
-				return nil, fmt.Errorf("truncated fixed64 field %d", number)
+				return envelopeScan{}, fmt.Errorf("truncated fixed64 field %d", number)
 			}
 			offset += 8
 		case wireBytes:
 			length, next, err := readVarint(data, offset)
 			if err != nil {
-				return nil, err
+				return envelopeScan{}, err
 			}
 			offset = next
 			if length > uint64(len(data)-offset) {
-				return nil, fmt.Errorf("truncated bytes field %d", number)
+				return envelopeScan{}, fmt.Errorf("truncated bytes field %d", number)
 			}
-			field.bytes = data[offset : offset+int(length)]
+			bytesValue = data[offset : offset+int(length)]
 			offset += int(length)
 		case wireFixed32:
 			if len(data)-offset < 4 {
-				return nil, fmt.Errorf("truncated fixed32 field %d", number)
+				return envelopeScan{}, fmt.Errorf("truncated fixed32 field %d", number)
 			}
 			offset += 4
 		case wireStartGroup, wireEndGroup:
-			return nil, fmt.Errorf("unsupported group wire type %d", wireType)
+			return envelopeScan{}, fmt.Errorf("unsupported group wire type %d", wireType)
 		default:
-			return nil, fmt.Errorf("unsupported wire type %d", wireType)
+			return envelopeScan{}, fmt.Errorf("unsupported wire type %d", wireType)
 		}
-		field.raw = data[start:offset]
-		fields = append(fields, field)
+
+		switch number {
+		case msyncCompressField:
+			if wireType != wireVarint {
+				return envelopeScan{}, fmt.Errorf("msync compress_algorimth has wire type %d", wireType)
+			}
+			result.hasCompression = true
+			result.compression = varintValue
+			result.compressionRaw = wireRange{start: start, end: offset}
+		case msyncPayloadField:
+			if wireType != wireBytes {
+				return envelopeScan{}, fmt.Errorf("msync payload has wire type %d", wireType)
+			}
+			result.hasPayload = true
+			result.payload = bytesValue
+			result.payloadRaw = wireRange{start: start, end: offset}
+		}
 	}
-	return fields, nil
+	return result, nil
+}
+
+func rebuiltEnvelopeSize(inputLen int, envelope envelopeScan, payloadLen int) (int, error) {
+	removed := (envelope.compressionRaw.end - envelope.compressionRaw.start) +
+		(envelope.payloadRaw.end - envelope.payloadRaw.start)
+	if removed < 0 || removed > inputLen {
+		return 0, fmt.Errorf("invalid msync envelope field ranges")
+	}
+
+	total := uint64(inputLen - removed)
+	var ok bool
+	total, ok = checkedAdd(total, uint64(varintSize(msyncCompressField<<3|wireVarint)+1))
+	if !ok {
+		return 0, fmt.Errorf("%w: rebuilt msync envelope length overflows", protocol.ErrLimitExceeded)
+	}
+	total, ok = checkedAdd(total, uint64(varintSize(msyncPayloadField<<3|wireBytes)))
+	if !ok {
+		return 0, fmt.Errorf("%w: rebuilt msync envelope length overflows", protocol.ErrLimitExceeded)
+	}
+	total, ok = checkedAdd(total, uint64(varintSize(uint64(payloadLen))))
+	if !ok {
+		return 0, fmt.Errorf("%w: rebuilt msync envelope length overflows", protocol.ErrLimitExceeded)
+	}
+	total, ok = checkedAdd(total, uint64(payloadLen))
+	if !ok || total > protocol.MaxCodecInputBytes {
+		return 0, fmt.Errorf("%w: rebuilt msync envelope exceeds %d bytes", protocol.ErrLimitExceeded, protocol.MaxCodecInputBytes)
+	}
+	return int(total), nil
+}
+
+func checkedAdd(a, b uint64) (uint64, bool) {
+	if a > ^uint64(0)-b {
+		return 0, false
+	}
+	return a + b, true
+}
+
+func varintSize(value uint64) int {
+	var encoded [binary.MaxVarintLen64]byte
+	return binary.PutUvarint(encoded[:], value)
+}
+
+func appendCompressionField(dst []byte) []byte {
+	dst = appendKey(dst, msyncCompressField, wireVarint)
+	return appendVarint(dst, 0)
+}
+
+func appendPayloadField(dst, payload []byte) []byte {
+	dst = appendKey(dst, msyncPayloadField, wireBytes)
+	dst = appendVarint(dst, uint64(len(payload)))
+	return append(dst, payload...)
 }
 
 func readVarint(data []byte, offset int) (uint64, int, error) {

@@ -7,7 +7,7 @@ user_id: "xu"
 # GO_IM_SDK_TOKEN_FILE. GO_IM_SDK_TOKEN is useful for short-lived environments.
 token_file: ""
 # Last-resort inline token. If non-empty, this YAML file must be mode 0600.
-token: "YWMtMV_xcJb7EfGod4kKIoTvk1zzvlQ7sUrSpVuQGlyIzFSOTJ1wgwsR8K7Uwf5qp-67AwMAAAGf-n-9nAAFfkDyncBIiJj7LyCHHX3jRSWEEuTJ6jT3zVjAJKRODI4i9g"
+token: "YWMt9raeBJrHEfGOfCnGVQkkOlzzvlQ7sUrSpVuQGlyIzFSOTJ1wgwsR8K7Uwf5qp-67AwMAAAGgE2bkSAAFfkDgutzT78BaZNLPtlyVI2Nkpc-T9rNbDLHtZxWDp8j3hg"
 
 domain: "easemob.com"
 resource: "golang-server-xu"

@@ -1,6 +1,10 @@
 package protocol
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+)
 
 func TestWireEnumValues(t *testing.T) {
 	checks := map[string]struct{ got, want int32 }{
@@ -14,5 +18,74 @@ func TestWireEnumValues(t *testing.T) {
 		if c.got != c.want {
 			t.Errorf("%s=%d want %d", name, c.got, c.want)
 		}
+	}
+}
+
+func TestSyncRetainedWeightAccountsForDynamicCapacity(t *testing.T) {
+	base := &Sync{Metas: []Meta{{Payload: []byte{1}}}}
+	baseWeight, err := SyncRetainedWeight(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withCapacity := &Sync{
+		Status: &Status{Reason: strings.Repeat("r", 1024), Redirects: make([]RedirectInfo, 1, 8)},
+		Queue:  &JID{AppKey: "app", Name: "queue", Domain: "example.test", ClientResource: "resource"},
+		Metas:  make([]Meta, 1, 8),
+	}
+	withCapacity.Metas[0] = Meta{
+		From:          JID{AppKey: "app", Name: "from", Domain: "example.test"},
+		To:            JID{AppKey: "app", Name: "to", Domain: "example.test"},
+		Payload:       make([]byte, 1, 1<<20),
+		Ext:           make([]KeyValue, 1, 8),
+		DirectedUsers: make([]string, 1, 16),
+		Environment:   "production",
+	}
+	withCapacity.Metas[0].Ext[0] = KeyValue{Key: "key", String: strings.Repeat("v", 1024)}
+	withCapacity.Metas[0].DirectedUsers[0] = "user"
+	capacityWeight, err := SyncRetainedWeight(withCapacity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capacityWeight <= baseWeight {
+		t.Fatalf("capacity weight = %d, want greater than base %d", capacityWeight, baseWeight)
+	}
+	if uint64(capacityWeight)%retainedPageSize != 0 {
+		t.Fatalf("capacity weight = %d, want %d-byte page rounding", capacityWeight, retainedPageSize)
+	}
+}
+
+func TestSyncRetainedWeightRejectsOverLimit(t *testing.T) {
+	sync := &Sync{Metas: []Meta{{Payload: make([]byte, 5<<20)}}}
+	weight, err := SyncRetainedWeight(sync)
+	if weight != 0 || !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("SyncRetainedWeight() = (%d, %v), want 0 ErrLimitExceeded", weight, err)
+	}
+}
+
+func TestSyncRetainedWeightAcceptsConfiguredSyncMaxima(t *testing.T) {
+	sync := &Sync{Metas: make([]Meta, MaxSyncMetas)}
+	user := strings.Repeat("u", MaxSyncStringBytes/MaxSyncDirectedUsers)
+	for i := range sync.Metas {
+		sync.Metas[i].Payload = make([]byte, MaxSyncPayloadBytes/MaxSyncMetas)
+		sync.Metas[i].DirectedUsers = []string{user, user, user, user}
+	}
+	weight, err := SyncRetainedWeight(sync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if weight <= 0 || weight > MaxSyncRetainedWeight {
+		t.Fatalf("SyncRetainedWeight() = %d, want within (0, %d]", weight, MaxSyncRetainedWeight)
+	}
+}
+
+func TestSyncRetainedWeightCheckedArithmetic(t *testing.T) {
+	if _, ok := checkedRetainedAdd(^uint64(0), 1); ok {
+		t.Fatal("checkedRetainedAdd accepted overflow")
+	}
+	if _, ok := checkedRetainedMul(^uint64(0), 2); ok {
+		t.Fatal("checkedRetainedMul accepted overflow")
+	}
+	if _, ok := checkedRetainedRoundUp(^uint64(0), retainedPageSize); ok {
+		t.Fatal("checkedRetainedRoundUp accepted overflow")
 	}
 }

@@ -36,12 +36,14 @@ const (
 	ErrResourceChanged    ErrorCode = "USER_DEVICE_CHANGED"
 	ErrAuthentication     ErrorCode = "AUTHENTICATION_FAILED"
 	ErrProtocol           ErrorCode = "PROTOCOL_ERROR"
+	ErrProtocolLimit      ErrorCode = "PROTOCOL_LIMIT"
 	ErrRedirectLoop       ErrorCode = "REDIRECT_LOOP"
 	ErrRedirectLimit      ErrorCode = "REDIRECT_LIMIT"
 	ErrHandlerFailed      ErrorCode = "HANDLER_FAILED"
 	ErrHandlerBacklog     ErrorCode = "HANDLER_BACKLOG"
 	ErrKickedChangePass   ErrorCode = "KICKED_BY_PASSWORD_CHANGE"
 	ErrSendOutcomeUnknown ErrorCode = "SEND_OUTCOME_UNKNOWN"
+	ErrMessageIDExhausted ErrorCode = "MESSAGE_ID_EXHAUSTED"
 )
 
 type SDKError struct {

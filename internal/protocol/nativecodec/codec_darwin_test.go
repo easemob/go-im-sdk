@@ -4,11 +4,103 @@ package nativecodec
 
 import (
 	"bytes"
+	"errors"
 	"math"
+	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/easemob/go-im-sdk/internal/protocol"
 )
+
+func TestNativeCodecLimitConstantsAndTrackers(t *testing.T) {
+	if got := nativeCodecMaxInputBytes(); got != protocol.MaxCodecInputBytes {
+		t.Fatalf("native max input bytes = %d, Go limit = %d", got, protocol.MaxCodecInputBytes)
+	}
+
+	tracker := &decodeTracker{}
+	if err := tracker.addPayload(protocol.MaxSyncPayloadBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := tracker.addPayload(1); !errors.Is(err, protocol.ErrLimitExceeded) {
+		t.Fatalf("payload overflow error = %v, want ErrLimitExceeded", err)
+	}
+	if err := tracker.addDirectedUsers(protocol.MaxSyncDirectedUsers); err != nil {
+		t.Fatal(err)
+	}
+	if err := tracker.addDirectedUsers(1); !errors.Is(err, protocol.ErrLimitExceeded) {
+		t.Fatalf("directed user overflow error = %v, want ErrLimitExceeded", err)
+	}
+}
+
+func TestNativeCodecBoundedCStringCopy(t *testing.T) {
+	exact := append(bytes.Repeat([]byte{'x'}, protocol.MaxSyncStringBytes), 0)
+	tracker := &decodeTracker{}
+	got, err := tracker.readStringPointer(unsafe.Pointer(&exact[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != protocol.MaxSyncStringBytes || tracker.stringBytes != protocol.MaxSyncStringBytes {
+		t.Fatalf("copied length/tracked = %d/%d", len(got), tracker.stringBytes)
+	}
+
+	over := append(bytes.Repeat([]byte{'x'}, protocol.MaxSyncStringBytes+1), 0)
+	tracker = &decodeTracker{}
+	got, err = tracker.readStringPointer(unsafe.Pointer(&over[0]))
+	if got != "" || !errors.Is(err, protocol.ErrLimitExceeded) || tracker.stringBytes != 0 {
+		t.Fatalf("over-limit read = (%d bytes, %v, tracked=%d), want no copy ErrLimitExceeded", len(got), err, tracker.stringBytes)
+	}
+
+	half := append([]byte(strings.Repeat("y", protocol.MaxSyncStringBytes/2)), 0)
+	tracker = &decodeTracker{}
+	for i := 0; i < 2; i++ {
+		if _, err = tracker.readStringPointer(unsafe.Pointer(&half[0])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	one := []byte{'z', 0}
+	if _, err = tracker.readStringPointer(unsafe.Pointer(&one[0])); !errors.Is(err, protocol.ErrLimitExceeded) {
+		t.Fatalf("shared string overflow error = %v, want ErrLimitExceeded", err)
+	}
+}
+
+func TestNativeCodecJIDBoundsBeforeCopy(t *testing.T) {
+	component := append(bytes.Repeat([]byte{'j'}, protocol.MaxJIDComponentBytes), 0)
+	p := unsafe.Pointer(&component[0])
+	tracker := &decodeTracker{}
+	jid, err := readJIDPointers([4]unsafe.Pointer{p, p, p, p}, tracker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jid.AppKey)+len(jid.Name)+len(jid.Domain)+len(jid.ClientResource) != protocol.MaxJIDBytes {
+		t.Fatalf("JID copied length = %d, want %d", len(jid.AppKey)+len(jid.Name)+len(jid.Domain)+len(jid.ClientResource), protocol.MaxJIDBytes)
+	}
+
+	over := append(bytes.Repeat([]byte{'j'}, protocol.MaxJIDComponentBytes+1), 0)
+	tracker = &decodeTracker{}
+	jid, err = readJIDPointers([4]unsafe.Pointer{unsafe.Pointer(&over[0])}, tracker)
+	if jid != (protocol.JID{}) || !errors.Is(err, protocol.ErrLimitExceeded) || tracker.stringBytes != 0 {
+		t.Fatalf("over-limit JID = (%+v, %v, tracked=%d), want no copy ErrLimitExceeded", jid, err, tracker.stringBytes)
+	}
+}
+
+func TestNativeCodecReadBytesReportsErrors(t *testing.T) {
+	if got, err := readBytes(nil, 1); got != nil || err == nil || errors.Is(err, protocol.ErrLimitExceeded) {
+		t.Fatalf("nil readBytes = (%v, %v), want ordinary error", got, err)
+	}
+	if got, err := readBytes(nil, protocol.MaxCodecInputBytes+1); got != nil || !errors.Is(err, protocol.ErrLimitExceeded) {
+		t.Fatalf("oversized readBytes = (%v, %v), want ErrLimitExceeded", got, err)
+	}
+	input := []byte{1, 2, 3}
+	got, err := readBytes(unsafe.Pointer(&input[0]), uint64(len(input)))
+	if err != nil || !bytes.Equal(got, input) {
+		t.Fatalf("readBytes = (%v, %v), want %v", got, err, input)
+	}
+	input[0] = 9
+	if got[0] != 1 {
+		t.Fatal("readBytes did not return an owned copy")
+	}
+}
 
 func TestNativeCodecSemanticRoundTrip(t *testing.T) {
 	c, err := New()

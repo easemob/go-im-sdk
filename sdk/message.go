@@ -8,8 +8,6 @@ import (
 	"math"
 	"sort"
 	"strconv"
-	"sync/atomic"
-	"time"
 
 	internalprotocol "github.com/easemob/go-im-sdk/internal/protocol"
 )
@@ -171,17 +169,10 @@ type SendResult struct {
 	ServerTimestamp uint64
 }
 
-var messageIDCounter atomic.Uint64
-
-func nextClientMessageID() uint64 {
-	// A millisecond time prefix makes IDs useful in diagnostics; the atomic
-	// suffix guarantees uniqueness inside the process, which is the SDK's
-	// documented idempotency boundary.
-	prefix := uint64(time.Now().UnixMilli()) << 20
-	return prefix | (messageIDCounter.Add(1) & ((1 << 20) - 1))
-}
-
 func buildOutgoingMeta(codec internalprotocol.Codec, appKey, userID, domain, resource string, req SendRequest) (internalprotocol.Meta, error) {
+	if req.ClientMessageID == 0 {
+		return internalprotocol.Meta{}, errors.New("ClientMessageID is required")
+	}
 	if req.To == "" {
 		return internalprotocol.Meta{}, errors.New("message recipient is required")
 	}
@@ -216,15 +207,11 @@ func buildOutgoingMeta(codec internalprotocol.Codec, appKey, userID, domain, res
 	if err != nil {
 		return internalprotocol.Meta{}, fmt.Errorf("marshal message body: %w", err)
 	}
-	id := req.ClientMessageID
-	if id == 0 {
-		id = nextClientMessageID()
-	}
 	route := internalprotocol.RouteAll
 	if len(req.DirectedUsers) > 0 {
 		route = internalprotocol.RouteDirect
 	}
-	return internalprotocol.Meta{ID: id, To: to, Namespace: internalprotocol.NamespaceChat, Payload: payload, Route: route, DirectedUsers: append([]string(nil), req.DirectedUsers...)}, nil
+	return internalprotocol.Meta{ID: req.ClientMessageID, To: to, Namespace: internalprotocol.NamespaceChat, Payload: payload, Route: route, DirectedUsers: append([]string(nil), req.DirectedUsers...)}, nil
 }
 
 func buildSendMeta(c *Client, userID string, req SendRequest, id uint64) (internalprotocol.Meta, error) {

@@ -3,6 +3,11 @@
 // copy input/output buffers and must not retain caller memory.
 package protocol
 
+import (
+	"fmt"
+	"unsafe"
+)
+
 type Command int32
 
 const (
@@ -151,6 +156,171 @@ type Meta struct {
 	ExpireTime     uint64
 	LocalTimestamp uint64
 	Environment    string
+}
+
+const (
+	retainedAllocationQuantum  = uint64(128)
+	retainedAllocationOverhead = uint64(16)
+	retainedSafetyFactor       = uint64(2)
+	retainedPageSize           = uint64(4 << 10)
+)
+
+// SyncRetainedWeight returns a conservative deterministic charge for a Sync
+// retained by an SDK worker queue. It accounts for object and slice backing
+// allocations, rounds each allocation upward, applies a safety factor, then
+// rounds the result to a page. The result is a queue-admission charge rather
+// than a claim about the process's complete RSS.
+func SyncRetainedWeight(sync *Sync) (int64, error) {
+	if sync == nil {
+		return 0, nil
+	}
+	var estimate retainedWeightEstimator
+	if err := estimate.allocation(uint64(unsafe.Sizeof(*sync))); err != nil {
+		return 0, err
+	}
+	if sync.Status != nil {
+		if err := estimate.allocation(uint64(unsafe.Sizeof(*sync.Status))); err != nil {
+			return 0, err
+		}
+		if err := estimate.string(sync.Status.Reason); err != nil {
+			return 0, err
+		}
+		if err := estimate.slice(cap(sync.Status.Redirects), unsafe.Sizeof(RedirectInfo{})); err != nil {
+			return 0, err
+		}
+		for i := range sync.Status.Redirects {
+			if err := estimate.string(sync.Status.Redirects[i].Host); err != nil {
+				return 0, err
+			}
+		}
+	}
+	if sync.Queue != nil {
+		if err := estimate.allocation(uint64(unsafe.Sizeof(*sync.Queue))); err != nil {
+			return 0, err
+		}
+		if err := estimate.jid(*sync.Queue); err != nil {
+			return 0, err
+		}
+	}
+	if err := estimate.slice(cap(sync.Metas), unsafe.Sizeof(Meta{})); err != nil {
+		return 0, err
+	}
+	for i := range sync.Metas {
+		meta := &sync.Metas[i]
+		if err := estimate.slice(cap(meta.Payload), unsafe.Sizeof(byte(0))); err != nil {
+			return 0, err
+		}
+		if err := estimate.jid(meta.From); err != nil {
+			return 0, err
+		}
+		if err := estimate.jid(meta.To); err != nil {
+			return 0, err
+		}
+		if err := estimate.slice(cap(meta.Ext), unsafe.Sizeof(KeyValue{})); err != nil {
+			return 0, err
+		}
+		for j := range meta.Ext {
+			if err := estimate.string(meta.Ext[j].Key); err != nil {
+				return 0, err
+			}
+			if err := estimate.string(meta.Ext[j].String); err != nil {
+				return 0, err
+			}
+		}
+		if err := estimate.slice(cap(meta.DirectedUsers), unsafe.Sizeof(string(""))); err != nil {
+			return 0, err
+		}
+		for _, user := range meta.DirectedUsers {
+			if err := estimate.string(user); err != nil {
+				return 0, err
+			}
+		}
+		if err := estimate.string(meta.Environment); err != nil {
+			return 0, err
+		}
+	}
+
+	weighted, ok := checkedRetainedMul(estimate.total, retainedSafetyFactor)
+	if !ok {
+		return 0, fmt.Errorf("%w: sync retained weight overflows", ErrLimitExceeded)
+	}
+	weighted, ok = checkedRetainedRoundUp(weighted, retainedPageSize)
+	if !ok || weighted > MaxSyncRetainedWeight {
+		return 0, fmt.Errorf("%w: sync retained weight exceeds %d bytes", ErrLimitExceeded, MaxSyncRetainedWeight)
+	}
+	return int64(weighted), nil
+}
+
+type retainedWeightEstimator struct {
+	total uint64
+}
+
+func (e *retainedWeightEstimator) allocation(size uint64) error {
+	if size == 0 {
+		return nil
+	}
+	rounded, ok := checkedRetainedRoundUp(size, retainedAllocationQuantum)
+	if !ok {
+		return fmt.Errorf("%w: sync retained allocation overflows", ErrLimitExceeded)
+	}
+	rounded, ok = checkedRetainedAdd(rounded, retainedAllocationOverhead)
+	if !ok {
+		return fmt.Errorf("%w: sync retained allocation overflows", ErrLimitExceeded)
+	}
+	e.total, ok = checkedRetainedAdd(e.total, rounded)
+	if !ok {
+		return fmt.Errorf("%w: sync retained weight overflows", ErrLimitExceeded)
+	}
+	return nil
+}
+
+func (e *retainedWeightEstimator) slice(capacity int, elementSize uintptr) error {
+	if capacity <= 0 {
+		return nil
+	}
+	size, ok := checkedRetainedMul(uint64(capacity), uint64(elementSize))
+	if !ok {
+		return fmt.Errorf("%w: sync retained slice overflows", ErrLimitExceeded)
+	}
+	return e.allocation(size)
+}
+
+func (e *retainedWeightEstimator) string(value string) error {
+	return e.allocation(uint64(len(value)))
+}
+
+func (e *retainedWeightEstimator) jid(jid JID) error {
+	for _, value := range [...]string{jid.AppKey, jid.Name, jid.Domain, jid.ClientResource} {
+		if err := e.string(value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkedRetainedAdd(a, b uint64) (uint64, bool) {
+	if a > ^uint64(0)-b {
+		return 0, false
+	}
+	return a + b, true
+}
+
+func checkedRetainedMul(a, b uint64) (uint64, bool) {
+	if a != 0 && b > ^uint64(0)/a {
+		return 0, false
+	}
+	return a * b, true
+}
+
+func checkedRetainedRoundUp(value, quantum uint64) (uint64, bool) {
+	if quantum == 0 {
+		return 0, false
+	}
+	remainder := value % quantum
+	if remainder == 0 {
+		return value, true
+	}
+	return checkedRetainedAdd(value, quantum-remainder)
 }
 
 type MessageKind int32

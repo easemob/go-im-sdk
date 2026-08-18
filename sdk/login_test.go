@@ -59,7 +59,8 @@ func (*lifecycleCodec) DecodeMessageBody([]byte) (*internalprotocol.MessageBody,
 }
 func (*lifecycleCodec) DecodeStatistic([]byte) (*internalprotocol.Statistic, error) { return nil, nil }
 
-func TestLogoutAllowsLoginAgainAndRefetchesDNS(t *testing.T) {
+func TestLogoutAllowsLoginAgainAndReusesFreshDNSCache(t *testing.T) {
+	withTestSharedDNSResolver(t, time.Now)
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -144,8 +145,8 @@ func TestLogoutAllowsLoginAgainAndRefetchesDNS(t *testing.T) {
 			t.Fatalf("after logout connected=%v state=%s closed=%v", client.Connected(), client.LoginState(), client.closed)
 		}
 	}
-	if dnsRequests.Load() != 2 {
-		t.Fatalf("DNS requests=%d", dnsRequests.Load())
+	if dnsRequests.Load() != 1 {
+		t.Fatalf("DNS requests=%d, want one fresh-cache fill", dnsRequests.Load())
 	}
 	codec.mu.Lock()
 	defer codec.mu.Unlock()
