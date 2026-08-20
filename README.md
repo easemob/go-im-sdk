@@ -100,7 +100,7 @@ flowchart TD
         C & D --> E["返回 Client（未登录）"]
     end
 
-    subgraph 登录 Login(ctx, userID, token)
+    subgraph "登录 Login(ctx, userID, token)"
         F["校验参数 + 加锁"] --> G["状态 LoggingIn/Connecting<br/>回调 ConnStateConnecting"]
         G --> H["resolveCachedEndpointCandidates<br/>DNS/cache 取 WSS 候选与 REST 地址"]
         H --> I["候选轮换 + connectWithRedirects<br/>WebSocket 拨号，起 readPump/writePump"]
