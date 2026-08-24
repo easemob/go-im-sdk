@@ -509,11 +509,18 @@ func (r *connectionRun) dispatch(frame *internalprotocol.Frame) {
 			r.fail(protocolError("unread", int32(st.Code), st.Reason))
 			return
 		}
-		// UNREAD is intentionally acknowledged but not consumed. This SDK's
-		// scope is realtime long-link delivery; the service owns roaming/offline
-		// history retrieval through its REST-facing workflow.
+		// Consume the unread queue list. Each entry identifies a queue with
+		// backlog (offline/undelivered) messages; drive it through the same
+		// startQueue path used by NOTICE so those messages are delivered to the
+		// MessageHandler like realtime ones. Processing is idempotent and
+		// cursor(key)-deduplicated, so handling this on every UNREAD (including
+		// the 120s heartbeat responses) is safe and also acts as a continuous
+		// safety net across reconnects.
+		for i := range frame.Unread.Queues {
+			r.startQueue(frame.Unread.Queues[i])
+		}
 		if r.client.debug && len(frame.Unread.Queues) > 0 {
-			r.client.logger.Debug("wss.unread_ignored", "queue_count", len(frame.Unread.Queues))
+			r.client.logger.Debug("wss.unread_pull", "queue_count", len(frame.Unread.Queues))
 		}
 		r.lastPong.Store(time.Now().UnixNano())
 	case internalprotocol.CommandNotice:

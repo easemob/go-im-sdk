@@ -12,7 +12,7 @@
 - Linux 客户发布构建默认使用 Module 内置 native codec，需要 `CGO_ENABLED=1` 和可用的 C/C++ 编译链接工具链。
 - 客户构建只使用 native codec；Go generated protobuf 和协议源码不属于客户发布包。
 - Module 通过 cgo 链接按 `GOOS/GOARCH` 提供的静态 `.a`；不要求业务工程额外集成 Apple framework 或部署 `.so`。
-- SDK 处理实时消息，不存储会话/未读，也不消费断线期间的积压消息。
+- SDK 处理实时消息，不存储会话/未读；登录后会通过 UNREAD 下行拉取离线/断线期间的积压消息，并与在线消息一样经 `MessageHandler` 投递给上层。
 
 安装：
 

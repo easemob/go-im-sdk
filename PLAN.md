@@ -33,7 +33,7 @@
 ### 1.2 不做
 
 - ws/TCP 传输、压缩（zlib/LZ4）、业务层加密（传输安全仅依赖 TLS）
-- 会话、未读数、已读回执、撤回/编辑、消息缓存/存储；**离线/断线积压消息消费**（由客户后台 REST 自行拉取）
+- 会话、未读数、已读回执、撤回/编辑、消息缓存/存储（登录后的**离线/断线积压消息**已由 SDK 通过 UNREAD 拉取并经 `MessageHandler` 投递，见 1.1）
 - 好友、聊天室、presence、thread、reaction、翻译、推送
 - 群成员管理（加人/拉人/申请/邀请/审批/踢人/改群设置）—— 由**用户后台 REST** 完成
 - 登录相关 REST（token 由用户传入）
@@ -45,7 +45,7 @@
 - DNS config 不预埋 → 用户初始化传入 msync host+port 与 rest 地址
 - 客户保证同一个 UserID 同一时刻只由一个服务实例登录；SDK 不负责多实例选主、租约或互踢规避
 - 不设置/持久化 DeviceUUID；当前服务端单活场景不依赖设备身份
-- 服务端不需要会话/未读业务模型；**离线/断线积压消息不由 SDK 消费**——客户后台通过 REST API 自行拉取，SDK 仅负责在线实时投递
+- 服务端不需要会话/未读业务模型；**登录后的离线/断线积压消息由 SDK 通过 UNREAD 拉取**并经 `MessageHandler` 投递，与在线消息同一条链路，无需客户后台额外拉取
 
 ---
 
@@ -89,13 +89,14 @@ Go 实现：conn.WriteMessage(Binary, msyncBytes) / conn.ReadMessage() 得到裸
    → auth_token 非空时解析 token/expires_in，原子替换 Client 当前 token，再触发 OnTokenRotated 供上层持久化
 3. 【登录后首个保活】登录成功后发一次 MSync{command: UNREAD}（空 UnreadUL，兼作首个心跳）
    → 服务端回 UnreadDL{unread[]: MetaQueue{queue, n}}
-   → 【离线/积压消息：不消费】该队列列表是积压消息入口，本 SDK 直接忽略（客户后台用 REST 自行拉取）；
-     仅当 status==REDIRECT 时按重定向处理，其余错误按协议错误处理
+   → 【离线/积压消息：拉取】该队列列表是积压消息入口，对每个 queue 调 syncQueue(queue)（与第 4 步同路径），
+     把离线消息经 MessageHandler 投递；仅当 status==REDIRECT 时按重定向处理，其余错误按协议错误处理
 4. 【NOTICE 触发路径，P0-1】运行中收到 MSync{command: NOTICE, payload: CommNotice{queue}}
    → 该队列有新内容，调 syncQueue(queue) 主动拉取（与第 3 步同路径）
 5. 心跳保活：定时发 MSync{command: UNREAD}（空 UnreadUL），收到 UNREAD 下行视为 pong（更新保活时间）
-   → 【注意】心跳 UNREAD 下行可能带 unread 队列列表（积压入口），一律忽略，不当 pong 之外的任何处理
-   → 【在线投递通道】在线新消息通过 NOTICE 触发拉取（见第 4 步），不依赖 UNREAD 队列列表
+   → 【注意】心跳 UNREAD 下行可能带 unread 队列列表（积压入口），同样对每个 queue 调 syncQueue 拉取；
+     基于队列 cursor(key) 去重，稳态下无重投，兼作断线/心跳期间的持续兜底
+   → 【在线投递通道】在线新消息通过 NOTICE 触发拉取（见第 4 步）；UNREAD 队列列表则用于登录及兜底的离线拉取
 6. 发送：MSync{command: SYNC, payload: CommSyncUL{meta}}
    → 按 Meta.id 等待服务端下行 ACK：CommSyncDL{meta_id=上行id, server_id, timestamp, status}
    → 【发送成功定义】收到对应 meta_id 的 ACK 即完成：server_id 即服务端消息 ID，
@@ -110,7 +111,7 @@ Go 实现：conn.WriteMessage(Binary, msyncBytes) / conn.ReadMessage() 得到裸
 |---|---|
 | PROVISION | 登录结果（等待中的 login channel） |
 | SYNC | `meta_id>0`：发送 ACK；否则按 metas[] 分发 CHAT/STATISTIC；MUC 和不需要的 NOTIFY 丢弃；批次处理完成后推进 next_key |
-| UNREAD | 先检查 Status；OK → 仅视为 pong（更新保活），**unread 队列列表忽略**（积压由客户 REST 拉取）；REDIRECT → 受限切址；其他错误按协议错误处理 |
+| UNREAD | 先检查 Status；OK → 更新保活（pong），并对 **unread 队列列表逐个 syncQueue 拉取离线消息**（基于 cursor 去重、幂等）；REDIRECT → 受限切址；其他错误按协议错误处理 |
 | NOTICE | CommNotice{queue} → syncQueue(queue) |
 | LOGOUT | 登出结果 |
 
@@ -556,7 +557,7 @@ handler_concurrency: 4
 - **并发**：并发 Send/Close/Logout、写队列满、慢 handler、断线时 pending ACK、goroutine 泄漏，必须通过 race detector
 - **网络与安全**：TLS/证书失败、网络半开、超大/截断/畸形 PB、未知 enum/body、redirect 环/空地址/降级尝试
 - **REST**：公开群创建固定 public=true/membersonly=false；加入公开群/重复加入/非公开群/审批群/群满；退出群/重复退出；以及 context cancel、超时、401/403/404/429+Retry-After、大响应、路径转义、敏感字段脱敏和 telemetry；容量/群数量不本地判断，以服务端返回为准
-- **回归重点**：登录成功后必须发首个 UNREAD 保活；UNREAD.status=REDIRECT 必须切址；handler 未成功不得推进 next_key；UNREAD 下行队列列表被忽略不触发拉取
+- **回归重点**：登录成功后必须发首个 UNREAD 保活；UNREAD.status=REDIRECT 必须切址；handler 未成功不得推进 next_key；UNREAD 下行队列列表须对每个 queue 触发 syncQueue 拉取离线消息（幂等、基于 cursor 去重）
 - 全部测试离线运行，不依赖真实服务端；解析器增加 fuzz test
 
 ---
@@ -572,7 +573,8 @@ handler_concurrency: 4
    调用方重试必须复用 ClientMessageID
 7. 消息 handler 成功后才推进 queue 的 next_key；失败/panic 不确认，不允许静默丢消息
 8. 收消息链路：在线实时投递走 NOTICE → queue single-flight → CommSyncDL → handler → next_key；
-   登录后发首个 UNREAD 仅作保活，其下行队列列表（离线/积压入口）直接忽略，积压由客户后台 REST 拉取
+   登录后发首个 UNREAD 兼作保活，其下行队列列表（离线/积压入口）对每个 queue 走同一 syncQueue 拉取，
+   把离线消息经 handler 投递（基于 cursor 去重、幂等，心跳期间兜底）
 9. 一个 readPump + 一个 writePump；所有 WS 写串行，回调/telemetry 与 I/O pump 隔离并使用有界队列
 10. wss 错误按 Go 错误类型和错误链分类（不复制 libwebsockets 错误字符串）；分类不确定时保留 C++ reason 文案匹配兜底
 11. REDIRECT 同时处理 PROVISION/UNREAD Status，限制 hop、检测环并保持 wss/path/TLS

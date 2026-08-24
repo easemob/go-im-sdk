@@ -374,7 +374,7 @@ curl -sS \
 
 为避免误判，发送前记录 `xu` 和 `lxm2` 的 `message.received` 基线数；收到 ACK 后同时检查目标端 `+1` 和非目标端 `+0`。
 
-不要用 `wss.unread_ignored` 判断实时消息是否收到；该日志是 `UNREAD` 保活/离线边界信息。
+不要用 `wss.unread_pull` 判断实时消息是否收到；该日志表示 `UNREAD` 触发的离线队列拉取。
 
 ### 自动脚本测试
 
@@ -535,14 +535,14 @@ rest.request / rest.response / rest.error
 
 ## 七、离线消息边界
 
-Go IM SDK 不消费 `UNREAD` 返回的离线/断线积压队列：
+Go IM SDK 登录后会消费 `UNREAD` 返回的离线/断线积压队列，对每个队列走 SYNC 拉取，并与在线消息同一条链路经回调投递：
 
 ```text
-UNREAD -> 仅保活
+UNREAD -> 保活 + 对每个未读队列 SYNC -> 离线消息回调
 NOTICE -> SYNC -> 实时消息回调
 ```
 
-离线漫游消息由用户服务端通过 REST/漫游接口自行拉取。看到 `wss.unread_ignored` 是预期行为，不用于本次实时定向消息验收。
+离线消息与在线消息经同一 `MessageHandler` 回调返回（基于队列 cursor 去重，业务按 `MetaID` 幂等）。看到 `wss.unread_pull` 表示正在拉取离线积压队列。若做实时定向消息验收，请注意区分登录时拉取的历史离线消息与本轮实时消息。
 
 ## 八、停止 Demo
 

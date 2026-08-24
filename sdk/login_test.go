@@ -22,6 +22,7 @@ import (
 type lifecycleCodec struct {
 	mu         sync.Mutex
 	provisions []internalprotocol.ProvisionRequest
+	syncQueues []string
 }
 
 func (c *lifecycleCodec) EncodeProvision(req internalprotocol.ProvisionRequest) ([]byte, error) {
@@ -31,7 +32,12 @@ func (c *lifecycleCodec) EncodeProvision(req internalprotocol.ProvisionRequest) 
 	return []byte("provision"), nil
 }
 func (*lifecycleCodec) EncodeUnread() ([]byte, error) { return []byte("unread"), nil }
-func (*lifecycleCodec) EncodeSync(internalprotocol.SyncRequest) ([]byte, error) {
+func (c *lifecycleCodec) EncodeSync(req internalprotocol.SyncRequest) ([]byte, error) {
+	if req.Queue != nil {
+		c.mu.Lock()
+		c.syncQueues = append(c.syncQueues, req.Queue.Name)
+		c.mu.Unlock()
+	}
 	return []byte("sync"), nil
 }
 func (*lifecycleCodec) EncodeLogout(internalprotocol.LogoutRequest) ([]byte, error) {
@@ -45,6 +51,18 @@ func (*lifecycleCodec) DecodeFrame(data []byte) (*internalprotocol.Frame, error)
 		}}, nil
 	case "logout-ok":
 		return &internalprotocol.Frame{Command: internalprotocol.CommandLogout, Logout: &internalprotocol.Logout{
+			Status: &internalprotocol.Status{Code: internalprotocol.StatusOK},
+		}}, nil
+	case "unread-queues":
+		return &internalprotocol.Frame{Command: internalprotocol.CommandUnread, Unread: &internalprotocol.Unread{
+			Status: &internalprotocol.Status{Code: internalprotocol.StatusOK},
+			Queues: []internalprotocol.JID{
+				{AppKey: "app", Name: "peer-1", Domain: "easemob.com"},
+				{AppKey: "app", Name: "peer-2", Domain: "easemob.com"},
+			},
+		}}, nil
+	case "unread-empty":
+		return &internalprotocol.Frame{Command: internalprotocol.CommandUnread, Unread: &internalprotocol.Unread{
 			Status: &internalprotocol.Status{Code: internalprotocol.StatusOK},
 		}}, nil
 	default:
@@ -177,5 +195,194 @@ func TestLoginDNSFailureRestoresLoggedOutReusableState(t *testing.T) {
 	if client.closed || client.userID != "" || client.token != "" || client.msyncHost != "" || client.restBase != "" {
 		t.Fatalf("failed login retained session state: user=%q token=%t wss=%q rest=%q closed=%v",
 			client.userID, client.token != "", client.msyncHost, client.restBase, client.closed)
+	}
+}
+
+// newLifecycleClient wires a Client to talk to the given fake WSS server through
+// a DNS transport that always resolves to that server, and swaps in the
+// string-based lifecycleCodec used by these tests.
+func newLifecycleClient(t *testing.T, server *httptest.Server) (*Client, *lifecycleCodec) {
+	t.Helper()
+	serverURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, rawPort, err := net.SplitHostPort(serverURL.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(rawPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := validConfig()
+	config.HTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		body := fmt.Sprintf(`{"msync-wx":{"hosts":[{"protocol":"https","port":%d,"domain":%q,"priority":1}]},"rest":{"hosts":[{"protocol":"https","port":443,"domain":"rest.example","priority":1}]}}`, port, host)
+		return dnsResponse(http.StatusOK, body), nil
+	})}
+	client, err := New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closer, ok := client.codec.(interface{ Close() }); ok {
+		closer.Close()
+	}
+	codec := &lifecycleCodec{}
+	client.codec = codec
+	client.wsDialer.TLSClientConfig = server.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	return client, codec
+}
+
+// TestLoginPullsUnreadOfflineQueues verifies that when the server pushes an
+// UNREAD downlink carrying backlog queues, the SDK drives a SYNC pull for each
+// queue (mirroring emclient-linux's login-time offline message retrieval).
+func TestLoginPullsUnreadOfflineQueues(t *testing.T) {
+	withTestSharedDNSResolver(t, time.Now)
+	upgrader := websocket.Upgrader{}
+	syncFrames := make(chan struct{}, 8)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		if _, frame, err := conn.ReadMessage(); err != nil || string(frame) != "provision" {
+			t.Errorf("provision frame=%q err=%v", frame, err)
+			return
+		}
+		if err := conn.WriteMessage(websocket.BinaryMessage, []byte("provision-ok")); err != nil {
+			t.Errorf("write provision: %v", err)
+			return
+		}
+		if _, frame, err := conn.ReadMessage(); err != nil || string(frame) != "unread" {
+			t.Errorf("unread frame=%q err=%v", frame, err)
+			return
+		}
+		if err := conn.WriteMessage(websocket.BinaryMessage, []byte("unread-queues")); err != nil {
+			t.Errorf("write unread-queues: %v", err)
+			return
+		}
+		for {
+			_, frame, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			switch string(frame) {
+			case "sync":
+				syncFrames <- struct{}{}
+			case "logout":
+				_ = conn.WriteMessage(websocket.BinaryMessage, []byte("logout-ok"))
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	client, codec := newLifecycleClient(t, server)
+	defer client.Close(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := client.Login(ctx, "user", "token"); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-syncFrames:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for offline SYNC pull %d", i+1)
+		}
+	}
+
+	codec.mu.Lock()
+	pulled := append([]string(nil), codec.syncQueues...)
+	codec.mu.Unlock()
+	seen := map[string]bool{}
+	for _, name := range pulled {
+		seen[name] = true
+	}
+	if !seen["peer-1"] || !seen["peer-2"] {
+		t.Fatalf("expected SYNC pulls for peer-1 and peer-2, got %v", pulled)
+	}
+
+	logoutCtx, logoutCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer logoutCancel()
+	if err := client.Logout(logoutCtx); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+}
+
+// TestUnreadEmptyQueuesDoesNotPull verifies that a steady-state UNREAD downlink
+// with no backlog queues only refreshes keepalive and never triggers a SYNC
+// pull, so the heartbeat path stays side-effect free.
+func TestUnreadEmptyQueuesDoesNotPull(t *testing.T) {
+	withTestSharedDNSResolver(t, time.Now)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		if _, frame, err := conn.ReadMessage(); err != nil || string(frame) != "provision" {
+			t.Errorf("provision frame=%q err=%v", frame, err)
+			return
+		}
+		if err := conn.WriteMessage(websocket.BinaryMessage, []byte("provision-ok")); err != nil {
+			t.Errorf("write provision: %v", err)
+			return
+		}
+		if _, frame, err := conn.ReadMessage(); err != nil || string(frame) != "unread" {
+			t.Errorf("unread frame=%q err=%v", frame, err)
+			return
+		}
+		if err := conn.WriteMessage(websocket.BinaryMessage, []byte("unread-empty")); err != nil {
+			t.Errorf("write unread-empty: %v", err)
+			return
+		}
+		for {
+			_, frame, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			switch string(frame) {
+			case "sync":
+				t.Errorf("unexpected SYNC pull for empty unread queues")
+			case "logout":
+				_ = conn.WriteMessage(websocket.BinaryMessage, []byte("logout-ok"))
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	client, codec := newLifecycleClient(t, server)
+	defer client.Close(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := client.Login(ctx, "user", "token"); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	// Allow the empty UNREAD downlink to be processed; assert no pulls resulted.
+	time.Sleep(300 * time.Millisecond)
+	if !client.Connected() {
+		t.Fatalf("client unexpectedly disconnected after empty UNREAD")
+	}
+	codec.mu.Lock()
+	pulled := len(codec.syncQueues)
+	codec.mu.Unlock()
+	if pulled != 0 {
+		t.Fatalf("expected no SYNC pulls for empty unread queues, got %d", pulled)
+	}
+
+	logoutCtx, logoutCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer logoutCancel()
+	if err := client.Logout(logoutCtx); err != nil {
+		t.Fatalf("Logout: %v", err)
 	}
 }
