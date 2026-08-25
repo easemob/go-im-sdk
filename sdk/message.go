@@ -23,6 +23,71 @@ type Message struct {
 	Timestamp uint64              `json:"timestamp"`
 	Body      *MessageBody        `json:"body"`
 	Ext       map[string]KeyValue `json:"ext,omitempty"`
+	// OnlineState reports whether the server delivered this message while the
+	// recipient was online. It is derived from the server-populated msync Meta
+	// attribute blob and requires the feature to be enabled server-side, so it
+	// is MessageOnlineStateUnknown whenever the server stays silent. Treat it
+	// as a hint: it is not a delivery guarantee, and it is never inferred from
+	// which pull the message arrived on.
+	OnlineState MessageOnlineState `json:"online_state,omitempty"`
+}
+
+// MessageOnlineState distinguishes a real-time delivery from an offline one
+// without collapsing the "server did not tell us" case into either answer.
+type MessageOnlineState string
+
+const (
+	// MessageOnlineStateUnknown is the zero value: the server did not report
+	// a state, so no claim is made either way.
+	MessageOnlineStateUnknown MessageOnlineState = ""
+	MessageOnlineStateOnline  MessageOnlineState = "online"
+	MessageOnlineStateOffline MessageOnlineState = "offline"
+)
+
+// messageOnlineStateKey is the server's wire spelling inside the Meta
+// attribute blob. Other Easemob SDKs persist the decoded value under the
+// different name "online_state"; only the wire name is read here.
+const messageOnlineStateKey = "is_online"
+
+// parseOnlineState reads is_online from the Meta attribute blob. Every failure
+// mode (absent blob, malformed JSON, absent or non-numeric key) yields Unknown
+// rather than an error: the attribute is advisory, and a message must never be
+// dropped because optional delivery metadata could not be understood.
+func parseOnlineState(attributes []byte) MessageOnlineState {
+	if len(attributes) == 0 {
+		return MessageOnlineStateUnknown
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(attributes, &decoded); err != nil {
+		return MessageOnlineStateUnknown
+	}
+	raw, ok := decoded[messageOnlineStateKey]
+	if !ok {
+		return MessageOnlineStateUnknown
+	}
+	// The server sends an integer, but accept a bool too so that a future
+	// server-side type change degrades to a correct read instead of Unknown.
+	// Both are decoded through pointers because unmarshalling a JSON null into
+	// a bare int64 succeeds and leaves a zero behind, which would silently
+	// report "offline" for a value the server never actually sent.
+	var number *int64
+	if err := json.Unmarshal(raw, &number); err == nil {
+		if number == nil {
+			return MessageOnlineStateUnknown
+		}
+		if *number == 0 {
+			return MessageOnlineStateOffline
+		}
+		return MessageOnlineStateOnline
+	}
+	var flag *bool
+	if err := json.Unmarshal(raw, &flag); err != nil || flag == nil {
+		return MessageOnlineStateUnknown
+	}
+	if *flag {
+		return MessageOnlineStateOnline
+	}
+	return MessageOnlineStateOffline
 }
 
 type MessageBodyType string
@@ -331,7 +396,7 @@ func parseIncomingMessage(codec internalprotocol.Codec, meta internalprotocol.Me
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal message body: %w", err)
 	}
-	msg := &Message{From: wire.From.Name, To: wire.To.Name, IsGroup: wire.Kind == internalprotocol.MessageGroupChat, MetaID: meta.ID, Timestamp: meta.Timestamp, Ext: decodeKeyValues(wire.Ext)}
+	msg := &Message{From: wire.From.Name, To: wire.To.Name, IsGroup: wire.Kind == internalprotocol.MessageGroupChat, MetaID: meta.ID, Timestamp: meta.Timestamp, Ext: decodeKeyValues(wire.Ext), OnlineState: parseOnlineState(meta.Attributes)}
 	// 对外只暴露单个 body：当前单条消息只对应一个 body，其它端 SDK 也尚未实现
 	// 多 body。若 wire 上意外出现多个 content，只取第一个，其余丢弃。
 	if len(wire.Contents) > 0 {

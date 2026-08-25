@@ -156,6 +156,11 @@ type Meta struct {
 	ExpireTime     uint64
 	LocalTimestamp uint64
 	Environment    string
+	// Attributes is the server-populated msync Meta field 9. When present it
+	// is a JSON object carrying delivery metadata such as "is_online". The
+	// server only emits it when the feature is enabled, so an empty value
+	// means "unknown" rather than any particular default.
+	Attributes []byte
 }
 
 const (
@@ -208,6 +213,9 @@ func SyncRetainedWeight(sync *Sync) (int64, error) {
 	for i := range sync.Metas {
 		meta := &sync.Metas[i]
 		if err := estimate.slice(cap(meta.Payload), unsafe.Sizeof(byte(0))); err != nil {
+			return 0, err
+		}
+		if err := estimate.slice(cap(meta.Attributes), unsafe.Sizeof(byte(0))); err != nil {
 			return 0, err
 		}
 		if err := estimate.jid(meta.From); err != nil {

@@ -13,6 +13,7 @@ WebSocket 保持在线，提供可靠消息收发、公开群 REST 操作和显�
 - `Send` 等待服务端 ACK；结果不确定时，业务重试必须复用原 `ClientMessageID`。
 - 消息 handler 返回 `nil` 后才确认队列进度。handler 应先完成持久化或可靠投递、按 `MetaID` 幂等，并及时响应传入 context。SDK 关闭不会等待忽略 context 的 handler；这类业务 goroutine 及其外部资源由用户负责终止。
 - SDK 不存储消息、不维护会话/未读模型，但登录后会通过 UNREAD 下行拉取离线/断线期间积压的消息，并与在线消息一样经 `MessageHandler` 投递给上层（基于队列 cursor 去重，业务仍需按 `MetaID` 幂等）。
+- `Message.OnlineState` 报告该消息投递时对端是否在线，取值 `online` / `offline` / `unknown`。它来自服务端下发的 msync `Meta` 属性（`is_online`），依赖服务端开关，未下发时为 `unknown`——SDK 不替服务端猜默认值，也不会用"消息走了哪条拉取"去推断。
 - 单个 IM 用户同一时刻只能由一个服务实例登录，选主或租约由业务系统负责。
 
 最低 Go 版本为 1.21。目前主要面向 Linux 服务端。
@@ -371,6 +372,9 @@ cp native/manifest.json.example native/manifest.json
 # 填写真实版本、制品路径与 SHA-256 后：
 RELEASE_DIR=/path/to/release-candidate ./scripts/verify-release.sh
 ```
+
+> linux-amd64 与 linux-arm64 归档均已在 Rocky 8（glibc 2.28 / gcc 8.5.0）上重编，并导出
+> `em_codec_meta_attributes()`。`EM_CODEC_ABI_VERSION` 保持为 1，因为这是纯增量改动。
 
 脚本校验 manifest、发布 allowlist、协议/实现源码泄漏、module 压缩与解压体积，并执行当前 Go 测试。
 发布包不得包含 `.proto`、`.pb.go`、`.pb.cc`、`.pb.h` 或私有 C++ 实现源码。开发树在迁移期间仍保留

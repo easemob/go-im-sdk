@@ -65,7 +65,7 @@ func main() {
 			full, marshalErr := marshalSafeMessage(msg)
 			attrs := []any{"meta_id", msg.MetaID, "from", msg.From, "to", msg.To,
 				"is_group", msg.IsGroup, "body_bytes", messageBodyBytes(msg),
-				"ext_count", len(msg.Ext)}
+				"ext_count", len(msg.Ext), "online_state", msg.OnlineState}
 			if msg.Body != nil {
 				attrs = append(attrs, "body_type", msg.Body.Type,
 					"body_text_bytes", len(msg.Body.Text),
@@ -271,17 +271,18 @@ func marshalSafeMessage(msg *imsdk.Message) ([]byte, error) {
 		Event  string                `json:"event,omitempty"`
 	}
 	type safeMessage struct {
-		From      string                    `json:"from"`
-		To        string                    `json:"to"`
-		IsGroup   bool                      `json:"is_group"`
-		MetaID    uint64                    `json:"meta_id"`
-		Timestamp uint64                    `json:"timestamp"`
-		Body      *safeBody                 `json:"body,omitempty"`
-		Ext       map[string]imsdk.KeyValue `json:"ext,omitempty"`
+		From        string                    `json:"from"`
+		To          string                    `json:"to"`
+		IsGroup     bool                      `json:"is_group"`
+		MetaID      uint64                    `json:"meta_id"`
+		Timestamp   uint64                    `json:"timestamp"`
+		Body        *safeBody                 `json:"body,omitempty"`
+		Ext         map[string]imsdk.KeyValue `json:"ext,omitempty"`
+		OnlineState imsdk.MessageOnlineState  `json:"online_state,omitempty"`
 	}
 	view := safeMessage{
 		From: msg.From, To: msg.To, IsGroup: msg.IsGroup, MetaID: msg.MetaID,
-		Timestamp: msg.Timestamp, Ext: msg.Ext,
+		Timestamp: msg.Timestamp, Ext: msg.Ext, OnlineState: msg.OnlineState,
 	}
 	if msg.Body != nil {
 		view.Body = &safeBody{Type: msg.Body.Type, Action: msg.Body.Action, Event: msg.Body.Event}

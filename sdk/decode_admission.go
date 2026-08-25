@@ -8,7 +8,12 @@ import (
 )
 
 const (
-	decodeAdmissionWait       = 500 * time.Millisecond
+	// decodeAdmissionWait must absorb a GC stop-the-world pause or a scheduling
+	// stall on a CPU-starved host without escalating to a disconnect. readPump
+	// is blocked for the duration, so the ceiling is the 240s heartbeat
+	// tolerance rather than anything tighter; 3s stays far below the 30s SYNC
+	// watchdog while giving transient pressure room to clear.
+	decodeAdmissionWait       = 3 * time.Second
 	decodeAdmissionTinyBytes  = int64(4 << 20)
 	decodeAdmissionSmallBytes = int64(16 << 20)
 	decodeAdmissionLargeBytes = int64(32 << 20)

@@ -566,6 +566,17 @@ func readSync(f *C.EMCodecFrame, st *protocol.Status, tracker *decodeTracker) (*
 		if err != nil {
 			return nil, err
 		}
+		// Field 9 shares the payload budget so an oversized attribute blob
+		// cannot become an unbounded allocation vector of its own.
+		var attributesLen C.size_t
+		attributes := C.em_codec_meta_attributes(f, i, &attributesLen)
+		if err := tracker.addPayload(uint64(attributesLen)); err != nil {
+			return nil, err
+		}
+		m.Attributes, err = readBytes(unsafe.Pointer(attributes), uint64(attributesLen))
+		if err != nil {
+			return nil, err
+		}
 		var j C.EMCodecJID
 		j.struct_size = C.uint32_t(C.sizeof_EMCodecJID)
 		if C.em_codec_meta_from(f, i, &j) != 0 {

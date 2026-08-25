@@ -163,6 +163,13 @@ uint64_t em_codec_meta_timestamp(const EMCodecFrame *frame, size_t index);
 uint32_t em_codec_meta_namespace(const EMCodecFrame *frame, size_t index);
 uint32_t em_codec_meta_route_type(const EMCodecFrame *frame, size_t index);
 const uint8_t *em_codec_meta_payload(const EMCodecFrame *frame, size_t index, size_t *size);
+/*
+ * Server-populated attribute blob (msync Meta field 9). When present it is a
+ * JSON object carrying delivery metadata such as "is_online". The field is
+ * optional and only emitted when the server enables it, so callers must treat
+ * an empty result as "unknown" rather than as a default value.
+ */
+const uint8_t *em_codec_meta_attributes(const EMCodecFrame *frame, size_t index, size_t *size);
 int em_codec_meta_from(const EMCodecFrame *frame, size_t index, EMCodecJID *jid);
 int em_codec_meta_to(const EMCodecFrame *frame, size_t index, EMCodecJID *jid);
 size_t em_codec_meta_directed_user_count(const EMCodecFrame *frame, size_t index);

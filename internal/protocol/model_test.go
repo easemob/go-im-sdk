@@ -54,6 +54,22 @@ func TestSyncRetainedWeightAccountsForDynamicCapacity(t *testing.T) {
 	}
 }
 
+func TestSyncRetainedWeightAccountsForMetaAttributes(t *testing.T) {
+	base := &Sync{Metas: []Meta{{Payload: []byte{1}}}}
+	baseWeight, err := SyncRetainedWeight(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withAttributes := &Sync{Metas: []Meta{{Payload: []byte{1}, Attributes: make([]byte, 1<<20)}}}
+	attributesWeight, err := SyncRetainedWeight(withAttributes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attributesWeight <= baseWeight {
+		t.Fatalf("attributes weight = %d, want greater than base %d", attributesWeight, baseWeight)
+	}
+}
+
 func TestSyncRetainedWeightRejectsOverLimit(t *testing.T) {
 	sync := &Sync{Metas: []Meta{{Payload: make([]byte, 5<<20)}}}
 	weight, err := SyncRetainedWeight(sync)
