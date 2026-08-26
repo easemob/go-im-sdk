@@ -30,6 +30,10 @@ type Message struct {
 	// as a hint: it is not a delivery guarantee, and it is never inferred from
 	// which pull the message arrived on.
 	OnlineState MessageOnlineState `json:"online_state,omitempty"`
+
+	// protocol is the collection snapshot used by ToJSON. It is filled when
+	// the message is parsed from the wire or built by NewOutgoingMessage.
+	protocol *messageProtocol
 }
 
 // MessageOnlineState distinguishes a real-time delivery from an offline one
@@ -396,13 +400,8 @@ func parseIncomingMessage(codec internalprotocol.Codec, meta internalprotocol.Me
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal message body: %w", err)
 	}
-	msg := &Message{From: wire.From.Name, To: wire.To.Name, IsGroup: wire.Kind == internalprotocol.MessageGroupChat, MetaID: meta.ID, Timestamp: meta.Timestamp, Ext: decodeKeyValues(wire.Ext), OnlineState: parseOnlineState(meta.Attributes)}
-	// 对外只暴露单个 body：当前单条消息只对应一个 body，其它端 SDK 也尚未实现
-	// 多 body。若 wire 上意外出现多个 content，只取第一个，其余丢弃。
-	if len(wire.Contents) > 0 {
-		msg.Body = decodeContent(wire.Contents[0])
-	}
-	return msg, nil
+	// 对外 Message 仍只暴露单个 body；ToJSON 的 payload.bodies 保留全部 content。
+	return messageFromProtocol(meta, wire), nil
 }
 
 func decodeContent(content internalprotocol.Content) *MessageBody {

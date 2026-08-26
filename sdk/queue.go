@@ -762,6 +762,16 @@ func (c *Client) Send(ctx context.Context, req SendRequest) (*SendResult, error)
 			return nil, err
 		}
 	}
+	if c.cfg.OnWillSend != nil {
+		outgoing := req
+		outgoing.ClientMessageID = id
+		snap, snapErr := NewOutgoingMessage(c.cfg.AppKey, userID, c.cfg.Domain, outgoing)
+		if snapErr != nil {
+			return nil, snapErr
+		}
+		handler := c.cfg.OnWillSend
+		safeCall(func() { handler(ctx, snap) })
+	}
 	meta, err := buildSendMeta(c, userID, req, id)
 	if err != nil {
 		return nil, err

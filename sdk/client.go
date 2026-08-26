@@ -64,6 +64,16 @@ type Config struct {
 	Telemetry        Telemetry
 	Debug            bool
 	MessageHandler   MessageHandler
+	// OnWillSend is invoked after the outbound ClientMessageID is assigned and
+	// before the message is encoded onto the wire. It is observational: the
+	// callback may call Message.ToJSON for test logs or storage. Panic is
+	// recovered and does not fail Send.
+	OnWillSend func(ctx context.Context, msg *Message)
+	// RESTErrorHandler is invoked when a REST request fails after it has been
+	// dispatched (transport error, unreadable body, or non-2xx). It does not
+	// include Authorization. Panic is recovered and does not change the
+	// returned error.
+	RESTErrorHandler RESTErrorHandler
 	// OnConnectionStateChanged is a best-effort state notification. Slow
 	// callbacks may coalesce/drop intermediate states; Health is authoritative.
 	OnConnectionStateChanged func(userID string, state ConnState)

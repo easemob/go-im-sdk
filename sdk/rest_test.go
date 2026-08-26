@@ -292,6 +292,53 @@ func TestRESTContextCancellation(t *testing.T) {
 	}
 }
 
+func TestRESTErrorHandlerSeesHTTPFailureAndSurvivesPanic(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Request-ID", "rid-1")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"message":"slow"}`)
+	}))
+	defer server.Close()
+
+	var got RESTErrorInfo
+	client := restTestClient(server, nil)
+	client.cfg.RESTErrorHandler = func(_ context.Context, info RESTErrorInfo) {
+		got = info
+		panic("observer must not change REST error")
+	}
+
+	_, err := client.UpdateOwnUserInfo(context.Background(), map[string]string{"a": "b"})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.ServiceCode != "EXCEED_SERVICE_LIMIT" {
+		t.Fatalf("error=%v", err)
+	}
+	if got.Operation != "update_own_user_info" || got.Method != http.MethodPut || got.Status != http.StatusTooManyRequests {
+		t.Fatalf("info=%#v", got)
+	}
+	if got.RequestID != "rid-1" || got.ServiceCode != "EXCEED_SERVICE_LIMIT" || got.Err == nil {
+		t.Fatalf("info=%#v", got)
+	}
+	if got.URL == "" || got.Err != err {
+		t.Fatalf("url=%q err=%v", got.URL, got.Err)
+	}
+}
+
+func TestRESTErrorHandlerSeesTransportFailure(t *testing.T) {
+	var got RESTErrorInfo
+	client := &Client{cfg: Config{
+		Resource: "go-server-imsdk-server-resource",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("dial refused")
+		})},
+		RESTErrorHandler: func(_ context.Context, info RESTErrorInfo) { got = info },
+	}, userID: "owner", token: "secret-token", restBase: "https://rest.example/org/app", state: LoginStateLoggedIn}
+
+	_, err := client.LeaveGroup(context.Background(), "group")
+	if err == nil || got.Err == nil || got.Status != 0 || got.Operation != "leave_group" {
+		t.Fatalf("err=%v info=%#v", err, got)
+	}
+}
+
 func TestParseRetryAfterHTTPDate(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	got := parseRetryAfter(now.Add(9*time.Second).Format(http.TimeFormat), now)

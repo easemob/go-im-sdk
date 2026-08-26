@@ -211,6 +211,30 @@ func fetchUserInfoServiceCode(status int) string {
 
 func genericServiceCode(status int) string { return "" }
 
+// RESTErrorInfo is the failure payload delivered to RESTErrorHandler.
+// Authorization is never included.
+type RESTErrorInfo struct {
+	Operation   string
+	Method      string
+	URL         string
+	Status      int
+	RequestID   string
+	ServiceCode string
+	Err         error
+}
+
+// RESTErrorHandler observes a failed REST call. It must not mutate the
+// request or expect to change the error returned to the caller.
+type RESTErrorHandler func(ctx context.Context, info RESTErrorInfo)
+
+func (c *Client) notifyRESTError(ctx context.Context, info RESTErrorInfo) {
+	if c == nil || info.Err == nil || c.cfg.RESTErrorHandler == nil {
+		return
+	}
+	handler := c.cfg.RESTErrorHandler
+	safeCall(func() { handler(ctx, info) })
+}
+
 func (c *Client) doREST(ctx context.Context, operation, method, path, rawQuery string, body io.Reader,
 	contentType string, mapCode serviceCodeMapper) (*Response, error) {
 	started := time.Now()
@@ -261,6 +285,7 @@ func (c *Client) doREST(ctx context.Context, operation, method, path, rawQuery s
 		if c.debug {
 			c.logger.Debug("rest.error", "operation", operation, "method", method, "url", endpoint, "error", resultErr)
 		}
+		c.notifyRESTError(ctx, RESTErrorInfo{Operation: operation, Method: method, URL: endpoint, Err: resultErr})
 		return nil, resultErr
 	}
 	defer httpResponse.Body.Close()
@@ -273,6 +298,10 @@ func (c *Client) doREST(ctx context.Context, operation, method, path, rawQuery s
 	}
 	if err != nil {
 		resultErr = &APIError{Response: response, RequestID: requestID(httpResponse.Header), Cause: err}
+		c.notifyRESTError(ctx, RESTErrorInfo{
+			Operation: operation, Method: method, URL: endpoint, Status: statusCode,
+			RequestID: requestID(httpResponse.Header), Err: resultErr,
+		})
 		return response, resultErr
 	}
 	if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
@@ -289,6 +318,10 @@ func (c *Client) doREST(ctx context.Context, operation, method, path, rawQuery s
 		Response: response, ServiceCode: serviceCode, RequestID: requestID(httpResponse.Header),
 		RetryAfter: parseRetryAfter(httpResponse.Header.Get("Retry-After"), time.Now()),
 	}
+	c.notifyRESTError(ctx, RESTErrorInfo{
+		Operation: operation, Method: method, URL: endpoint, Status: statusCode,
+		RequestID: requestID(httpResponse.Header), ServiceCode: serviceCode, Err: resultErr,
+	})
 	return response, resultErr
 }
 

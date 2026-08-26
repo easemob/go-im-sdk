@@ -61,6 +61,21 @@ func main() {
 		AppKey: fc.AppKey, Domain: fc.Domain, Resource: fc.Resource,
 		DisableReconnect: fc.DisableReconnect,
 		Logger:           logger, Debug: *debug,
+		OnWillSend: func(_ context.Context, msg *imsdk.Message) {
+			full, marshalErr := msg.ToJSON()
+			attrs := []any{"meta_id", msg.MetaID, "from", msg.From, "to", msg.To, "is_group", msg.IsGroup}
+			if marshalErr == nil {
+				attrs = append(attrs, "message_json", string(full))
+			} else {
+				attrs = append(attrs, "to_json_error", marshalErr)
+			}
+			logger.Info("message.will_send", attrs...)
+		},
+		RESTErrorHandler: func(_ context.Context, info imsdk.RESTErrorInfo) {
+			logger.Error("rest.error", "operation", info.Operation, "method", info.Method,
+				"url", info.URL, "status", info.Status, "request_id", info.RequestID,
+				"service_code", info.ServiceCode, "error", info.Err)
+		},
 		MessageHandler: func(_ context.Context, msg *imsdk.Message) error {
 			full, marshalErr := marshalSafeMessage(msg)
 			attrs := []any{"meta_id", msg.MetaID, "from", msg.From, "to", msg.To,

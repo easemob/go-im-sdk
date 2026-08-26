@@ -14,6 +14,8 @@ WebSocket 保持在线，提供可靠消息收发、公开群 REST 操作和显�
 - 消息 handler 返回 `nil` 后才确认队列进度。handler 应先完成持久化或可靠投递、按 `MetaID` 幂等，并及时响应传入 context。SDK 关闭不会等待忽略 context 的 handler；这类业务 goroutine 及其外部资源由用户负责终止。
 - SDK 不存储消息、不维护会话/未读模型，但登录后会通过 UNREAD 下行拉取离线/断线期间积压的消息，并与在线消息一样经 `MessageHandler` 投递给上层（基于队列 cursor 去重，业务仍需按 `MetaID` 幂等）。
 - `Message.OnlineState` 报告该消息投递时对端是否在线，取值 `online` / `offline` / `unknown`。它来自服务端下发的 msync `Meta` 属性（`is_online`），依赖服务端开关，未下发时为 `unknown`——SDK 不替服务端猜默认值，也不会用"消息走了哪条拉取"去推断。
+- `Message.ToJSON()` 输出协议级快照（msync `Meta` + `MessageBody` 字段名，零值也写出），便于业务收集存储。`json.Marshal(Message)` 仍是裁过的对外视图。发送侧可用 `NewOutgoingMessage` 得到同一份快照。
+- `OnWillSend` 在编码上线前给出即将发出的 `*Message`（已分配 `ClientMessageID`），测试可 `ToJSON()` 打日志；panic 不影响 `Send`。`RESTErrorHandler` 观察已发出的 REST 失败（无 Authorization）。
 - 单个 IM 用户同一时刻只能由一个服务实例登录，选主或租约由业务系统负责。
 
 最低 Go 版本为 1.21。目前主要面向 Linux 服务端。
