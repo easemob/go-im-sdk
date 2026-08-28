@@ -117,7 +117,7 @@ func TestProvisionReasonMapping(t *testing.T) {
 		status int32
 		reason string
 		want   ErrorCode
-	}{{1, "Sorry, token expired", ErrTokenExpired}, {1, "Sorry, token or password does not match login info", ErrInvalidToken}, {1, "Sorry, user not found", ErrUserNotFound}, {7, "Sorry, the app online count limit", ErrAppActiveLimit}, {12, "", ErrUserForbidden}, {20, "", ErrResourceChanged}}
+	}{{1, "Sorry, token expired", ErrTokenExpired}, {6, "", ErrTokenExpired}, {1, "Sorry, who are you?", ErrAuthentication}, {1, "Sorry, token or password does not match login info", ErrInvalidToken}, {1, "Sorry, user not found", ErrUserNotFound}, {7, "Sorry, the app online count limit", ErrAppActiveLimit}, {12, "", ErrUserForbidden}, {20, "", ErrResourceChanged}}
 	for _, tc := range cases {
 		if got := errorCode(protocolError("login", tc.status, tc.reason)); got != tc.want {
 			t.Fatalf("status %d got %s want %s", tc.status, got, tc.want)

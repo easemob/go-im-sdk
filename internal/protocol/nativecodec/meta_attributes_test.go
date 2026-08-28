@@ -76,3 +76,31 @@ func TestDecodeFrameCarriesMetaAttributes(t *testing.T) {
 		t.Fatalf("absent field 9 decoded to %#v, want nil", frame.Sync.Metas[1].Attributes)
 	}
 }
+
+func TestEncodeMessageBodyAllowsProductTextSizes(t *testing.T) {
+	c, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	body := protocol.MessageBody{
+		Kind: protocol.MessageChat,
+		From: protocol.JID{AppKey: "o#a", Name: "alice", Domain: "easemob.com"},
+		To:   protocol.JID{AppKey: "o#a", Name: "bob", Domain: "easemob.com"},
+	}
+	for _, n := range []int{4096, 4097, 5120, 5121} {
+		body.Contents = []protocol.Content{{Kind: protocol.ContentText, Text: string(bytes.Repeat([]byte{'a'}, n))}}
+		payload, err := c.EncodeMessageBody(body)
+		if err != nil {
+			t.Fatalf("%d-byte text: encode error %v", n, err)
+		}
+		decoded, err := c.DecodeMessageBody(payload)
+		if err != nil {
+			t.Fatalf("%d-byte text: decode error %v", n, err)
+		}
+		if len(decoded.Contents) != 1 || len(decoded.Contents[0].Text) != n {
+			t.Fatalf("%d-byte text: decoded len=%d", n, len(decoded.Contents[0].Text))
+		}
+	}
+}

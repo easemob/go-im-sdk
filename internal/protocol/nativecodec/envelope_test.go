@@ -337,6 +337,57 @@ func appendBytesFieldForTest(dst []byte, number uint64, value []byte) []byte {
 	return append(dst, value...)
 }
 
+func TestWithProvisionActionVersion(t *testing.T) {
+	body := appendBytesFieldForTest(nil, 2, []byte("4.0.0-go"))
+	frame := appendBytesFieldForTest(nil, msyncPayloadField, body)
+
+	got, err := withProvisionActionVersion(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := scanEnvelope(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version, ok := stringFieldForTest(envelope.payload, provisionActionVersionField); !ok || version != protocol.ActionVersion {
+		t.Fatalf("action_version=%q present=%v, want %q", version, ok, protocol.ActionVersion)
+	}
+
+	again, err := withProvisionActionVersion(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(again, got) {
+		t.Fatal("second attach changed an already-versioned envelope")
+	}
+}
+
+func stringFieldForTest(message []byte, number uint64) (string, bool) {
+	offset := 0
+	for offset < len(message) {
+		tag, next, err := readVarint(message, offset)
+		if err != nil {
+			return "", false
+		}
+		offset = next
+		field := tag >> 3
+		wireType := byte(tag & 7)
+		end, err := skipField(message, offset, wireType)
+		if err != nil {
+			return "", false
+		}
+		if field == number && wireType == wireBytes {
+			length, valueStart, err := readVarint(message, offset)
+			if err != nil {
+				return "", false
+			}
+			return string(message[valueStart : valueStart+int(length)]), true
+		}
+		offset = end
+	}
+	return "", false
+}
+
 func envelopeWithSizeForTest(t *testing.T, size int) []byte {
 	t.Helper()
 	for payloadSize := size - 2; payloadSize >= 0; payloadSize-- {

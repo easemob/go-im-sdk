@@ -3,6 +3,8 @@ package sdk
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -100,6 +102,31 @@ func TestBuildOutgoingMeta(t *testing.T) {
 			}
 		})
 	}
+}
+
+type encodeErrorCodec struct {
+	messageTestCodec
+	err error
+}
+
+func (c *encodeErrorCodec) EncodeMessageBody(internalprotocol.MessageBody) ([]byte, error) {
+	return nil, c.err
+}
+
+func TestBuildOutgoingMetaWrapsEncodeErrors(t *testing.T) {
+	req := SendRequest{ClientMessageID: 1, To: "bob", Body: MessageBody{Type: MessageBodyText, Text: "hello"}}
+	t.Run("limit", func(t *testing.T) {
+		_, err := buildOutgoingMeta(&encodeErrorCodec{err: fmt.Errorf("native: %w", internalprotocol.ErrLimitExceeded)}, "org#app", "alice", "easemob.com", "go", req)
+		if errorCode(err) != ErrProtocolLimit || !errors.Is(err, internalprotocol.ErrLimitExceeded) {
+			t.Fatalf("err=%v code=%s", err, errorCode(err))
+		}
+	})
+	t.Run("invalid", func(t *testing.T) {
+		_, err := buildOutgoingMeta(&encodeErrorCodec{err: errors.New("native codec error 1")}, "org#app", "alice", "easemob.com", "go", req)
+		if errorCode(err) != ErrProtocol {
+			t.Fatalf("err=%v code=%s", err, errorCode(err))
+		}
+	})
 }
 
 func TestBuildOutgoingMetaValidation(t *testing.T) {

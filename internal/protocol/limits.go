@@ -18,6 +18,10 @@ const (
 	MaxFrameCollectionItems = 4096
 )
 
+// ActionVersion is written on provision so MSync returns token detail errors
+// (action_version >= 3.0) and merges MUC presence events (>= 5.1).
+const ActionVersion = "v5.1"
+
 // ErrLimitExceeded marks deterministic protocol resource-limit violations.
 // Callers should use errors.Is because codec layers add operation context.
 var ErrLimitExceeded = errors.New("protocol limit exceeded")

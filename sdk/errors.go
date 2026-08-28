@@ -129,6 +129,8 @@ func protocolError(op string, status int32, reason string) error {
 		default:
 			code = ErrAuthentication
 		}
+	case 6:
+		code = ErrTokenExpired
 	case 2, 3, 4, 16, 17, 18:
 		code = ErrAuthentication
 	case 7:

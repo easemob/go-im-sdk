@@ -9,7 +9,7 @@
     "glibc": "2.28",
     "gcc": "8.5.0",
     "clang": "18.1.8",
-    "status": "protocol-regenerated; amd64-and-arm64-rebuilt-rocky8-with-em_codec_meta_attributes"
+    "status": "protocol-regenerated; amd64-and-arm64-rebuilt-rocky8-action-version-v5.1"
   },
   "artifacts": [
     {
@@ -17,14 +17,14 @@
       "goarch": "amd64",
       "libc": "glibc",
       "archive": "native/lib/linux-amd64-glibc/libem_msync_codec.a",
-      "sha256": "22374148ae36766c6bb031fea8727e7e0a436575b7eab9a9542f078170dd937c"
+      "sha256": "4fa1d3a42bc27a6e758c44f838390107fd1eaffc4446b995325734c5eb08a14b"
     },
     {
       "goos": "linux",
       "goarch": "arm64",
       "libc": "glibc",
       "archive": "native/lib/linux-arm64-glibc/libem_msync_codec.a",
-      "sha256": "65aeabc233339feb177509de99f96faeffc497be858d0202480f3d9ca91bd818"
+      "sha256": "1aad98b5377dffbefa78af03009ae5ab01b8c4abee9b55f3f80069cd37fecf56"
     }
   ]
 }

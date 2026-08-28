@@ -168,6 +168,13 @@ func TestNativeCodecSemanticRoundTrip(t *testing.T) {
 	if err != nil || len(provision) == 0 {
 		t.Fatalf("provision len=%d err=%v", len(provision), err)
 	}
+	envelope, err := scanEnvelope(provision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version, ok := stringFieldForTest(envelope.payload, provisionActionVersionField); !ok || version != protocol.ActionVersion {
+		t.Fatalf("provision action_version=%q present=%v, want %q", version, ok, protocol.ActionVersion)
+	}
 }
 
 func TestNativeCodecEmptyMessageExtHasCompatibleWireEncoding(t *testing.T) {

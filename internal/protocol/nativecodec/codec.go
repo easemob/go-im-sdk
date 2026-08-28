@@ -211,7 +211,11 @@ func (c *Codec) EncodeProvision(v protocol.ProvisionRequest) ([]byte, error) {
 	if e != C.EM_CODEC_OK {
 		return nil, codecError(e)
 	}
-	return takeBuffer(&out)
+	frame, err := takeBuffer(&out)
+	if err != nil {
+		return nil, err
+	}
+	return withProvisionActionVersion(frame)
 }
 func (c *Codec) EncodeUnread() ([]byte, error) {
 	c.mu.RLock()

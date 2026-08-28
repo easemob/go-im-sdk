@@ -274,7 +274,11 @@ func buildOutgoingMeta(codec internalprotocol.Codec, appKey, userID, domain, res
 		Contents: []internalprotocol.Content{content}, Ext: ext}
 	payload, err := codec.EncodeMessageBody(body)
 	if err != nil {
-		return internalprotocol.Meta{}, fmt.Errorf("marshal message body: %w", err)
+		code := ErrProtocol
+		if errors.Is(err, internalprotocol.ErrLimitExceeded) {
+			code = ErrProtocolLimit
+		}
+		return internalprotocol.Meta{}, wrapError(code, "marshal message body", err)
 	}
 	route := internalprotocol.RouteAll
 	if len(req.DirectedUsers) > 0 {
