@@ -270,7 +270,7 @@ func (c *Client) doREST(ctx context.Context, operation, method, path, rawQuery s
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "go+"+sdkVersion)
+	req.Header.Set("User-Agent", userAgent)
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}

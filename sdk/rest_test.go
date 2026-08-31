@@ -48,6 +48,9 @@ func TestUpdateOwnUserInfo(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer secret-token" {
 			t.Errorf("Authorization = %q", got)
 		}
+		if got := r.Header.Get("User-Agent"); got != userAgent {
+			t.Errorf("User-Agent = %q", got)
+		}
 		if got := r.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
 			t.Errorf("Content-Type = %q", got)
 		}

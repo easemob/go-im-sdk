@@ -317,7 +317,8 @@ func applyDefaultsAndValidate(c *Config) error {
 }
 
 const (
-	sdkVersion        = "4.0.0-go"
+	sdkVersion        = "5.0"
+	userAgent         = "goIMSDK/" + sdkVersion
 	resourcePrefix    = "go-server-imsdk-"
 	maxResourceLength = 128
 )
