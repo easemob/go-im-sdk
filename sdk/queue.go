@@ -624,7 +624,7 @@ func (r *connectionRun) processMetas(metas []internalprotocol.Meta) (err error) 
 		}
 		switch m.Namespace {
 		case internalprotocol.NamespaceChat:
-			msg, e := parseMessage(r.client, m)
+			wire, e := r.client.codec.DecodeMessageBody(m.Payload)
 			if e != nil {
 				// 消息体损坏：重投也解不开，死信该条并继续同批次其他消息，
 				// 避免拆链后服务端重投同一毒消息形成自伤式重连风暴。
@@ -634,6 +634,13 @@ func (r *connectionRun) processMetas(metas []internalprotocol.Meta) (err error) 
 				r.client.logger.Error("dropping undecodable message", "meta_id", m.ID, "error", e)
 				continue
 			}
+			if !shouldDeliverToHandler(wire) {
+				if r.client.debug {
+					r.client.logger.Debug("wss.message_ignored", "meta_id", m.ID, "message_type", int32(wire.Kind))
+				}
+				continue
+			}
+			msg := messageFromProtocol(m, wire)
 			if err := r.ctx.Err(); err != nil {
 				return err
 			}

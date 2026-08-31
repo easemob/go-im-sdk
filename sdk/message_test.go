@@ -45,7 +45,20 @@ func (c *messageTestCodec) DecodeStatistic([]byte) (*internalprotocol.Statistic,
 	return nil, nil
 }
 
+type scriptedMessageCodec struct {
+	messageTestCodec
+	bodies map[string]*internalprotocol.MessageBody
+}
+
+func (c *scriptedMessageCodec) DecodeMessageBody(payload []byte) (*internalprotocol.MessageBody, error) {
+	if body, ok := c.bodies[string(payload)]; ok {
+		return body, nil
+	}
+	return nil, fmt.Errorf("unexpected payload %q", payload)
+}
+
 var _ internalprotocol.Codec = (*messageTestCodec)(nil)
+var _ internalprotocol.Codec = (*scriptedMessageCodec)(nil)
 
 func TestBuildOutgoingMeta(t *testing.T) {
 	tests := []struct {
@@ -278,6 +291,85 @@ func TestKeyValueJSON64BitIntegersAreStrings(t *testing.T) {
 	}
 	if decoded["long"].Value != int64(math.MinInt64) || decoded["uint"].Value != uint64(math.MaxUint64) {
 		t.Fatalf("decoded=%#v", decoded)
+	}
+}
+
+func TestShouldDeliverToHandler(t *testing.T) {
+	text := []internalprotocol.Content{{Kind: internalprotocol.ContentText, Text: "hello"}}
+	tests := []struct {
+		name string
+		body *internalprotocol.MessageBody
+		want bool
+	}{
+		{name: "chat text", body: &internalprotocol.MessageBody{Kind: internalprotocol.MessageChat, Contents: text}, want: true},
+		{name: "group command", body: &internalprotocol.MessageBody{Kind: internalprotocol.MessageGroupChat, Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentCommand, Action: "run"}}}, want: true},
+		{name: "chat custom", body: &internalprotocol.MessageBody{Kind: internalprotocol.MessageChat, Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentCustom, Event: "alert"}}}, want: true},
+		{name: "chatroom text", body: &internalprotocol.MessageBody{Kind: internalprotocol.MessageChatRoom, Contents: text}, want: false},
+		{name: "recall", body: &internalprotocol.MessageBody{Kind: internalprotocol.MessageRecall, Contents: text}, want: false},
+		{name: "edit", body: &internalprotocol.MessageBody{Kind: internalprotocol.MessageEdit, Contents: text}, want: false},
+		{name: "deliver ack", body: &internalprotocol.MessageBody{Kind: internalprotocol.MessageDeliverACK, Contents: text}, want: false},
+		{name: "read ack", body: &internalprotocol.MessageBody{Kind: internalprotocol.MessageReadACK, Contents: text}, want: false},
+		{name: "channel ack", body: &internalprotocol.MessageBody{Kind: internalprotocol.MessageChannelACK, Contents: text}, want: false},
+		{name: "image", body: &internalprotocol.MessageBody{Kind: internalprotocol.MessageChat, Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentImage}}}, want: false},
+		{name: "video", body: &internalprotocol.MessageBody{Kind: internalprotocol.MessageGroupChat, Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentVideo}}}, want: false},
+		{name: "location", body: &internalprotocol.MessageBody{Kind: internalprotocol.MessageChat, Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentLocation}}}, want: false},
+		{name: "voice", body: &internalprotocol.MessageBody{Kind: internalprotocol.MessageChat, Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentVoice}}}, want: false},
+		{name: "file", body: &internalprotocol.MessageBody{Kind: internalprotocol.MessageChat, Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentFile}}}, want: false},
+		{name: "unknown content", body: &internalprotocol.MessageBody{Kind: internalprotocol.MessageChat, Contents: []internalprotocol.Content{{Kind: 99}}}, want: false},
+		{name: "empty contents", body: &internalprotocol.MessageBody{Kind: internalprotocol.MessageChat}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldDeliverToHandler(tt.body); got != tt.want {
+				t.Fatalf("shouldDeliverToHandler() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestProcessMetasSkipsUnsupportedMessages(t *testing.T) {
+	var got []uint64
+	codec := &scriptedMessageCodec{bodies: map[string]*internalprotocol.MessageBody{
+		"recall":      {Kind: internalprotocol.MessageRecall, Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentText, Text: "x"}}},
+		"edit":        {Kind: internalprotocol.MessageEdit, Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentText, Text: "x"}}},
+		"deliver-ack": {Kind: internalprotocol.MessageDeliverACK, Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentText, Text: "x"}}},
+		"read-ack":    {Kind: internalprotocol.MessageReadACK, Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentText, Text: "x"}}},
+		"image":       {Kind: internalprotocol.MessageChat, Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentImage}}},
+		"chatroom":    {Kind: internalprotocol.MessageChatRoom, Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentText, Text: "room"}}},
+		"text":        {Kind: internalprotocol.MessageChat, From: internalprotocol.JID{Name: "alice"}, To: internalprotocol.JID{Name: "bob"}, Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentText, Text: "hello"}}},
+		"command":     {Kind: internalprotocol.MessageGroupChat, Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentCommand, Action: "run"}}},
+		"custom":      {Kind: internalprotocol.MessageChat, Contents: []internalprotocol.Content{{Kind: internalprotocol.ContentCustom, Event: "alert"}}},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client := &Client{
+		cfg: Config{MessageHandler: func(_ context.Context, msg *Message) error {
+			got = append(got, msg.MetaID)
+			return nil
+		}},
+		logger: defaultLogger(),
+		codec:  codec,
+	}
+	run := &connectionRun{client: client, ctx: ctx}
+	err := run.processMetas([]internalprotocol.Meta{
+		{ID: 1, Namespace: internalprotocol.NamespaceChat, Payload: []byte("recall")},
+		{ID: 2, Namespace: internalprotocol.NamespaceChat, Payload: []byte("edit")},
+		{ID: 3, Namespace: internalprotocol.NamespaceChat, Payload: []byte("deliver-ack")},
+		{ID: 4, Namespace: internalprotocol.NamespaceChat, Payload: []byte("read-ack")},
+		{ID: 5, Namespace: internalprotocol.NamespaceChat, Payload: []byte("image")},
+		{ID: 9, Namespace: internalprotocol.NamespaceChat, Payload: []byte("chatroom")},
+		{ID: 6, Namespace: internalprotocol.NamespaceChat, Payload: []byte("text")},
+		{ID: 7, Namespace: internalprotocol.NamespaceChat, Payload: []byte("command")},
+		{ID: 8, Namespace: internalprotocol.NamespaceChat, Payload: []byte("custom")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[0] != 6 || got[1] != 7 || got[2] != 8 {
+		t.Fatalf("delivered=%v, want [6 7 8]", got)
+	}
+	if run.ctx.Err() != nil {
+		t.Fatalf("connection context ended: %v", run.ctx.Err())
 	}
 }
 

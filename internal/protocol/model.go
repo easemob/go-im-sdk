@@ -334,10 +334,15 @@ func checkedRetainedRoundUp(value, quantum uint64) (uint64, bool) {
 type MessageKind int32
 
 const (
-	MessageNormal MessageKind = iota
-	MessageChat
-	MessageGroupChat
-	MessageChatRoom
+	MessageNormal     MessageKind = 0
+	MessageChat       MessageKind = 1
+	MessageGroupChat  MessageKind = 2
+	MessageChatRoom   MessageKind = 3
+	MessageReadACK    MessageKind = 4
+	MessageDeliverACK MessageKind = 5
+	MessageRecall     MessageKind = 6
+	MessageChannelACK MessageKind = 7
+	MessageEdit       MessageKind = 8
 )
 
 type ContentKind int32
@@ -351,6 +356,7 @@ const (
 	ContentFile     ContentKind = 5
 	ContentCommand  ContentKind = 6
 	ContentCustom   ContentKind = 7
+	ContentCombine  ContentKind = 8
 )
 
 type MessageBody struct {

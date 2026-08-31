@@ -408,6 +408,30 @@ func parseIncomingMessage(codec internalprotocol.Codec, meta internalprotocol.Me
 	return messageFromProtocol(meta, wire), nil
 }
 
+// shouldDeliverToHandler keeps MessageHandler to chat/group conversation
+// payloads whose first body is text, command, or custom. Chatroom, recall,
+// edit, delivery/read/channel ACKs, and media/unknown bodies are dropped
+// after decode so the queue can still advance without reconnecting.
+func shouldDeliverToHandler(body *internalprotocol.MessageBody) bool {
+	if body == nil {
+		return false
+	}
+	switch body.Kind {
+	case internalprotocol.MessageChat, internalprotocol.MessageGroupChat:
+	default:
+		return false
+	}
+	if len(body.Contents) == 0 {
+		return false
+	}
+	switch body.Contents[0].Kind {
+	case internalprotocol.ContentText, internalprotocol.ContentCommand, internalprotocol.ContentCustom:
+		return true
+	default:
+		return false
+	}
+}
+
 func decodeContent(content internalprotocol.Content) *MessageBody {
 	body := &MessageBody{}
 	switch content.Kind {
