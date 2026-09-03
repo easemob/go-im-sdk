@@ -170,9 +170,21 @@ sequenceDiagram
 
 ### 心跳与重连
 
-- **心跳**：`heartbeat` 协程每 `HeartbeatInterval`(120s) 发一个空 `UNREAD` 当 ping；收到 `UNREAD` 下行当 pong 并更新 `lastPong`；超过 `HeartbeatTimeout`(240s) 未收到 pong、或 readPump 读超时则断链。
-- **网络断线自动重连**：状态切 `Reconnecting`，三段随机退避（5~10s / 20~40s / 60~120s）；每个退避周期最多拨号一个 WSS endpoint，endpoint-local 失败才推进候选，一轮耗尽后合并刷新 DNS，切 host 或刷新 DNS 都不会重置退避。稳定运行超 5 分钟才重置退避档位；重连后队列游标从 0 重新开始，可能重投历史消息，业务需按 `MetaID` 幂等。
-- **业务性断开不重连**：被踢出、鉴权失败、token 过期等进入终态，触发 `OnDisconnect`。
+断开后有两条路，不要把自动重连理解成业务再调一次 `Login`。
+
+| 断开类型 | 典型原因 | 业务回调 | 要不要再调 `Login` |
+|---|---|---|---|
+| 网络断线 | `ErrIO` / `ErrTimeout` / `ErrTLSFailed` / `ErrStreamClosed` / `ErrDNS`，心跳超时 | 只走 `OnConnectionStateChanged`：`Reconnecting` →（成功）`Connected` | **不用**。SDK 用内存里的 `userID` 和 token 自动重连 |
+| 业务性终态 | token 过期/无效、被踢、鉴权失败、用户禁用、改密等 | `OnDisconnect`；token 过期还会再触发 `OnTokenExpired` | **要**。会话已结束，换新 token 后重新 `Login` |
+
+- **心跳**：`heartbeat` 协程每 120s 发一个空 `UNREAD` 当 ping；收到 `UNREAD` 下行当 pong 并更新 `lastPong`；超过 240s 未收到 pong、或 readPump 读超时则断链。网络类断链走自动重连。
+- **自动重连在做什么**：业务侧**不会**再进 `Login`。SDK 内部重新拨 WSS，再用当前内存 token 发一遍 **PROVISION**（协议层重新登录），成功后再发 UNREAD 保活并拉离线积压。`OnDisconnect` **不会**在这条路上触发。
+- **自动重连节奏**：状态切 `Reconnecting`，三段随机退避（5~10s / 20~40s / 60~120s）。每个退避周期最多拨一个 WSS endpoint；endpoint-local 失败才换候选，一轮耗尽后刷新 DNS。切 host 或刷新 DNS 都不会重置退避；稳定运行超过 5 分钟才回到最低档。
+- **重连期间的发送**：`Send` 要求已登录且连接正常。`Reconnecting` 时发送会失败，等 `Connected()` 为 true 后再发。
+- **重连后的消息**：队列游标从 0 重新开始，服务端可能重投历史消息，业务必须按 `MetaID` 幂等。
+- **业务性断开不重连**：被踢、鉴权失败、token 过期等进入终态，只触发 `OnDisconnect`（token 过期同时 `OnTokenExpired`）。SDK 不会接着拨号或再发 PROVISION。
+- **`DisableReconnect=true`**：任何断开都按终态处理，走 `OnDisconnect`，不再自动重连。
+- **重连中途 `Logout` / `Close`**：会取消当前 DNS/拨号；`Logout` 后同一 Client 可以再次 `Login`。
 
 ## 回调处理
 
@@ -205,6 +217,8 @@ MessageHandler: func(ctx context.Context, msg *imsdk.Message) error {
 
 `OnConnectionStateChanged(userID, state)` 在连接状态变化时触发，`userID` 为当前登录用户。`ConnState` 取值：`ConnStateDisconnected` / `ConnStateConnecting` / `ConnStateConnected` / `ConnStateReconnecting`。用于展示在线状态与 ready 判定（通常 `Connected()` 为 true 才报 ready）。
 
+`Reconnecting` 只表示网络断线后的自动重连，不是业务再次调用 `Login`。自动重连成功会再回调 `Connected`；失败并落入终态时，才会转到 `OnDisconnect`，而不是一直停在 `Reconnecting`。
+
 ### OnDisconnect
 
 `OnDisconnect(userID, err)` 仅在**业务性断开（不会自动重连）**时触发，`userID` 为断开时的登录用户。通过 `errorCode(err)` 区分原因：
@@ -218,7 +232,7 @@ MessageHandler: func(ctx context.Context, msg *imsdk.Message) error {
 | `ErrAuthentication` / `ErrPermissionDenied` / `ErrAppActiveLimit` / `ErrUserNotFound` | 鉴权/权限/配额 | 告警排查 |
 | `ErrKickedChangePass` | 改密被踢 | 重新登录 |
 
-网络类错误（`ErrIO` / `ErrTimeout` / `ErrTLSFailed` / `ErrStreamClosed` / `ErrDNS`）走自动重连，**不会**触发 `OnDisconnect`。`DisableReconnect=true` 时任何断开都会转为 `OnDisconnect`。
+网络类错误（`ErrIO` / `ErrTimeout` / `ErrTLSFailed` / `ErrStreamClosed` / `ErrDNS`）走自动重连，**不会**触发 `OnDisconnect`，也不需要业务再调 `Login`。`DisableReconnect=true` 时任何断开都会转为 `OnDisconnect`。
 
 ### OnTokenExpired / OnTokenWillExpire
 
